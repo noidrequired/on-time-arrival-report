@@ -108,8 +108,8 @@ def read_excel(file_bytes) -> pd.DataFrame:
 def compute_arrival_delta_minutes(row):
     # Fallback when explicit 'Stop arrival delta (minutes)' is missing
     try:
-        a = row["actual_arrival"]
-        p = row["planned_arrival_start"]
+        a = row.get("actual_arrival")
+        p = row.get("planned_arrival_start")
         if pd.notna(a) and pd.notna(p):
             return (a - p).total_seconds() / 60.0
     except Exception:
@@ -117,11 +117,13 @@ def compute_arrival_delta_minutes(row):
     return np.nan
 
 def apply_on_time_rule(delta_minutes, threshold_minutes):
-    # on-time if 'minutes late' <= threshold
-    # Negative values (early) are always on-time
+    # Robust: return NaN when the delta can't be parsed
     if pd.isna(delta_minutes):
         return np.nan
-    return delta_minutes <= threshold_minutes
+    try:
+        return float(delta_minutes) <= float(threshold_minutes)
+    except Exception:
+        return np.nan
 
 # ---------- Sidebar: File upload ----------
 with st.sidebar:
@@ -132,7 +134,7 @@ with st.sidebar:
         """
         **Notes**
         - All timestamps are treated as the **same timezone** (as per your data).
-        - If **Stop arrival delta (minutes)** is missing, the app computes it from
+        - If **Stop arrival delta (minutes)** is missing or non-numeric, the app computes it from
           *Stop actual arrival time* − *Stop planned arrival time start*.
         """
     )
@@ -153,13 +155,16 @@ if df_raw.empty:
     st.stop()
 
 col_map = build_column_map(df_raw.columns)
-missing_for_report = [EXPECTED_COLUMNS[k] for k in REQUIRED_FOR_REPORT if k not in col_map]
-# 'arrival_delta_min' is preferred but we can compute, so don't hard-stop if it's missing.
-if "arrival_delta_min" in missing_for_report and all(
+
+# Build missing list using KEYS first, then convert to labels (fixes earlier logic)
+missing_keys = [k for k in REQUIRED_FOR_REPORT if k not in col_map]
+# 'arrival_delta_min' is preferred but we can compute if the timestamps are present
+if "arrival_delta_min" in missing_keys and all(
     k in col_map for k in ["planned_arrival_start", "actual_arrival"]
 ):
-    missing_for_report.remove("Stop arrival delta (minutes)")
+    missing_keys.remove("arrival_delta_min")
 
+missing_for_report = [EXPECTED_COLUMNS[k] for k in missing_keys]
 if missing_for_report:
     st.error(
         "Your file is missing required columns for the report:\n\n- " +
@@ -174,6 +179,12 @@ df.columns = [k for k in col_map.keys()]
 # Parse datetimes
 for k in set(DATETIME_KEYS).intersection(df.columns):
     df[k] = to_datetime(df[k])
+
+# Trim whitespace & normalize empties in object columns
+for c in df.columns:
+    if df[c].dtype == "object":
+        df[c] = df[c].astype(str).str.strip()
+        df[c] = df[c].replace({"": np.nan})
 
 # Ensure arrival delta exists (minutes)
 if "arrival_delta_min" not in df.columns:
@@ -192,7 +203,7 @@ with st.sidebar:
         help="Start typing to find stops to exclude"
     )
 
-    # Carriers - Exclude mode (as requested)
+    # Carriers - Exclude mode
     all_carriers = sorted([c for c in df["current_carrier"].dropna().astype(str).unique()])
     exclude_carriers = st.multiselect(
         "Exclude these Carriers",
@@ -255,13 +266,22 @@ if start_date and end_date:
 filtered = df[mask].copy()
 
 # ---------- Compute on-time ----------
-if prefer_explicit_delta or filtered["arrival_delta_min"].notna().any():
-    delta = filtered["arrival_delta_min"]
+# Build a numeric delta series (coerce strings like ' ' → NaN).
+if prefer_explicit_delta and "arrival_delta_min" in filtered.columns:
+    delta_series = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
 else:
-    # recompute from timestamps just in case (robustness)
-    delta = filtered.apply(compute_arrival_delta_minutes, axis=1)
+    delta_series = filtered.apply(compute_arrival_delta_minutes, axis=1)
 
-filtered["is_on_time"] = delta.apply(lambda x: apply_on_time_rule(x, threshold))
+# If recomputed/all-NaN, try the other source as a fallback
+if delta_series.notna().sum() == 0:
+    if prefer_explicit_delta:
+        # fallback to recompute
+        delta_series = filtered.apply(compute_arrival_delta_minutes, axis=1)
+    elif "arrival_delta_min" in filtered.columns:
+        # fallback to explicit numeric
+        delta_series = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
+
+filtered["is_on_time"] = delta_series.apply(lambda x: apply_on_time_rule(x, threshold))
 
 # ---------- Report ----------
 st.subheader("Results")
@@ -273,7 +293,7 @@ with mid:
     valid = filtered["is_on_time"].notna().sum()
     st.metric("Stops w/ valid arrival delta", f"{valid:,}")
 with right:
-    ontime = filtered["is_on_time"].sum(skipna=True)
+    ontime = int(filtered["is_on_time"].fillna(False).sum())
     rate = (ontime / valid * 100) if valid else 0.0
     st.metric("On-time rate", f"{rate:.1f}%")
 
@@ -355,3 +375,8 @@ with st.expander("Column Mapping & Data Health"):
     if present_keys:
         st.write("**Nulls in key columns (after filters):**")
         st.write(filtered[present_keys].isna().sum())
+
+    # Optional: visibility on non-numeric deltas
+    if "arrival_delta_min" in filtered.columns:
+        tmp = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
+        st.write("Non-numeric 'Stop arrival delta (minutes)' after coercion:", int(tmp.isna().sum()))
