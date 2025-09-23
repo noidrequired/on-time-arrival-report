@@ -156,7 +156,7 @@ if df_raw.empty:
 
 col_map = build_column_map(df_raw.columns)
 
-# Build missing list using KEYS first, then convert to labels (fixes earlier logic)
+# Build missing list using keys first, then convert to labels
 missing_keys = [k for k in REQUIRED_FOR_REPORT if k not in col_map]
 # 'arrival_delta_min' is preferred but we can compute if the timestamps are present
 if "arrival_delta_min" in missing_keys and all(
@@ -283,19 +283,29 @@ if delta_series.notna().sum() == 0:
 
 filtered["is_on_time"] = delta_series.apply(lambda x: apply_on_time_rule(x, threshold))
 
+# Flags for visibility and aggregation
+filtered["valid_for_ontime"] = delta_series.notna()
+filtered["no_arrival_time"] = filtered["actual_arrival"].isna()
+
 # ---------- Report ----------
 st.subheader("Results")
 
 left, mid, right = st.columns(3)
 with left:
     st.metric("Stops (after filters)", f"{len(filtered):,}")
+
 with mid:
-    valid = filtered["is_on_time"].notna().sum()
-    st.metric("Stops w/ valid arrival delta", f"{valid:,}")
+    valid = int(filtered["valid_for_ontime"].sum())
+    st.metric("Stops with arrival data", f"{valid:,}")
+
 with right:
-    ontime = int(filtered["is_on_time"].fillna(False).sum())
-    rate = (ontime / valid * 100) if valid else 0.0
-    st.metric("On-time rate", f"{rate:.1f}%")
+    no_arrival_ct = int(filtered["no_arrival_time"].sum())
+    st.metric("Stops with no arrival time", f"{no_arrival_ct:,}")
+
+# On-time rate among stops with arrival data
+ontime = int(filtered["is_on_time"].fillna(False).sum())
+rate = (ontime / valid * 100) if valid else 0.0
+st.metric("On-time rate (of those with arrival data)", f"{rate:.1f}%")
 
 # Group by carrier
 if "current_carrier" not in filtered.columns or filtered.empty:
@@ -305,22 +315,37 @@ else:
         filtered
         .groupby("current_carrier", dropna=False)
         .agg(
-            total_stops=("is_on_time", "count"),
+            total_stops=("stop_name", "size"),                 # includes rows with NA
+            with_arrival_data=("valid_for_ontime", "sum"),     # rows where delta is evaluable
             on_time_stops=("is_on_time", lambda s: s.fillna(False).sum()),
+            no_arrival_time=("no_arrival_time", "sum"),        # rows missing actual_arrival
         )
         .reset_index()
     )
-    grp["on_time_rate"] = np.where(grp["total_stops"] > 0, grp["on_time_stops"] / grp["total_stops"], np.nan)
+    # On-time % computed only over those with arrival data
+    grp["on_time_rate"] = np.where(grp["with_arrival_data"] > 0,
+                                   grp["on_time_stops"] / grp["with_arrival_data"],
+                                   np.nan)
 
     st.markdown("### On-time by Carrier")
-    st.dataframe(
-        grp.sort_values(["on_time_rate", "total_stops"], ascending=[False, False])
-          .assign(on_time_rate=lambda d: (d["on_time_rate"] * 100).round(1))
-          .rename(columns={"current_carrier": "Carrier", "on_time_rate": "On-time %"})
+    display_grp = (
+        grp
+        .assign(**{"On-time %": (grp["on_time_rate"] * 100).round(1)})
+        .rename(columns={
+            "current_carrier": "Carrier",
+            "total_stops": "Total stops",
+            "with_arrival_data": "With arrival data",
+            "no_arrival_time": "No arrival time",
+            "on_time_stops": "On-time stops",
+        })[
+            ["Carrier", "Total stops", "With arrival data", "No arrival time", "On-time stops", "On-time %"]
+        ]
+        .sort_values(["On-time %", "Total stops"], ascending=[False, False])
     )
+    st.dataframe(display_grp, use_container_width=True)
 
-    # Chart
-    if not grp.empty and grp["on_time_rate"].notna().any():
+    # Chart (On-time % by carrier)
+    if grp["on_time_rate"].notna().any():
         chart_data = grp.copy()
         chart_data["On-time %"] = (chart_data["on_time_rate"] * 100).round(2)
         chart = (
@@ -332,6 +357,8 @@ else:
                 tooltip=[
                     alt.Tooltip("current_carrier:N", title="Carrier"),
                     alt.Tooltip("total_stops:Q", title="Total stops"),
+                    alt.Tooltip("with_arrival_data:Q", title="With arrival data"),
+                    alt.Tooltip("no_arrival_time:Q", title="No arrival time"),
                     alt.Tooltip("on_time_stops:Q", title="On-time stops"),
                     alt.Tooltip("On-time %:Q"),
                 ]
@@ -354,6 +381,20 @@ with col1:
 
 with col2:
     out = grp.copy() if 'grp' in locals() else pd.DataFrame()
+    if not out.empty:
+        out = (
+            out.assign(on_time_percent=(out["on_time_rate"] * 100).round(1))
+               .rename(columns={
+                    "current_carrier": "Carrier",
+                    "total_stops": "Total stops",
+                    "with_arrival_data": "With arrival data",
+                    "no_arrival_time": "No arrival time",
+                    "on_time_stops": "On-time stops",
+                    "on_time_percent": "On-time %"
+               })[
+                    ["Carrier", "Total stops", "With arrival data", "No arrival time", "On-time stops", "On-time %"]
+               ]
+        )
     csv = out.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download on-time by carrier (CSV)",
@@ -376,7 +417,7 @@ with st.expander("Column Mapping & Data Health"):
         st.write("**Nulls in key columns (after filters):**")
         st.write(filtered[present_keys].isna().sum())
 
-    # Optional: visibility on non-numeric deltas
+    # Visibility on non-numeric deltas
     if "arrival_delta_min" in filtered.columns:
         tmp = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
         st.write("Non-numeric 'Stop arrival delta (minutes)' after coercion:", int(tmp.isna().sum()))
