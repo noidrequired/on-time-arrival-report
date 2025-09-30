@@ -134,8 +134,6 @@ def _mk_column_config(df: pd.DataFrame) -> dict:
 def pretty_df(df: pd.DataFrame, *, use_container_width=True, height=None, hide_index=True):
     """
     Drop-in replacement for st.dataframe with better formatting.
-    Auto-detects percent/minute/datetime columns and applies formatting.
-
     Streamlit 1.36+: avoid passing height=None; only pass height if it's a positive int or "auto".
     """
     if df is None or df.empty:
@@ -149,16 +147,12 @@ def pretty_df(df: pd.DataFrame, *, use_container_width=True, height=None, hide_i
         hide_index=hide_index,
         column_config=cfg,
     )
-
-    # Pass height only if valid
     if isinstance(height, (int, np.integer)) and int(height) > 0:
         kwargs["height"] = int(height)
     elif height == "auto":
         kwargs["height"] = "auto"
-    # else: omit height entirely
 
     st.dataframe(df, **kwargs)
-
 
 # Enable theme + CSS
 _register_altair_theme()
@@ -424,7 +418,7 @@ with st.sidebar:
         key="avg_mode",
         help="Raw delay averages the minutes late. Overage averages how far past the threshold you were."
     )
-    avg_overage = (avg_mode == "Overage beyond threshold (late only)")
+    avg_overage_sidebar = (avg_mode == "Overage beyond threshold (late only)")
 
     st.header("4) SLA Bands (based on overage beyond threshold)")
     c_b1, c_b2, c_b3 = st.columns(3)
