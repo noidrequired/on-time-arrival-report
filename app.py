@@ -1,4 +1,5 @@
 import io
+import json
 from datetime import datetime, date, timedelta
 
 import numpy as np
@@ -14,7 +15,7 @@ st.set_page_config(
 )
 
 st.title("On-Time Arrival Report")
-st.caption("Upload your Excel → choose filters → see on-time performance by carrier and stop")
+st.caption("Upload your Excel → choose filters → see on-time performance by carrier, stop, and shipment coverage")
 
 # ---------- Helpers ----------
 EXPECTED_COLUMNS = {
@@ -77,10 +78,12 @@ DATETIME_KEYS = {
 REQUIRED_FOR_REPORT = {
     "stop_name",
     "planned_arrival_start",
+    "planned_arrival_end",
     "actual_arrival",
     "arrival_delta_min",  # preferred, but we will compute if missing
     "current_carrier",
     "created_time",
+    "shipment_id",
 }
 
 def normalize_columns(cols):
@@ -122,6 +125,13 @@ def apply_on_time_rule(delta_minutes, threshold_minutes):
         return float(delta_minutes) <= float(threshold_minutes)
     except Exception:
         return np.nan
+
+def safe_mode(series: pd.Series, fallback="(Unknown)"):
+    ser = series.dropna().astype(str)
+    if ser.empty:
+        return fallback
+    vc = ser.value_counts()
+    return vc.index[0] if not vc.empty else fallback
 
 # ---------- Sidebar: File upload ----------
 with st.sidebar:
@@ -190,22 +200,33 @@ if "arrival_delta_min" not in df.columns:
 with st.sidebar:
     st.header("2) Filters")
 
-    # Stop names - Exclude mode
-    all_stops = sorted([s for s in df["stop_name"].dropna().astype(str).unique()])
-    exclude_stops = st.multiselect(
-        "Exclude these Stop names",
-        options=all_stops,
-        default=[],
-        help="Start typing to find stops to exclude"
+    # Include / Exclude switch (applies to both Stop and Carrier)
+    filter_mode = st.radio(
+        "Filter mode",
+        options=["Exclude", "Include"],
+        index=0,
+        key="filter_mode",
+        help="Exclude: remove selected. Include: keep only selected (if none selected, keep all)."
     )
 
-    # Carriers - Exclude mode
+    # Stop names
+    all_stops = sorted([s for s in df["stop_name"].dropna().astype(str).unique()])
+    stop_selection = st.multiselect(
+        "Stop names",
+        options=all_stops,
+        default=[],
+        key="stops_select",
+        help="Select stops to Exclude/Include per the filter mode above."
+    )
+
+    # Carriers
     all_carriers = sorted([c for c in df["current_carrier"].dropna().astype(str).unique()])
-    exclude_carriers = st.multiselect(
-        "Exclude these Carriers",
+    carrier_selection = st.multiselect(
+        "Carriers",
         options=all_carriers,
         default=[],
-        help="Start typing to find carriers to exclude"
+        key="carriers_select",
+        help="Select carriers to Exclude/Include per the filter mode above."
     )
 
     # Date range on Created time
@@ -220,7 +241,8 @@ with st.sidebar:
             "Created time range",
             value=(min_date, max_date),
             min_value=min_date,
-            max_value=max_date
+            max_value=max_date,
+            key="created_range"
         )
 
     st.header("3) On-time Rule")
@@ -228,7 +250,8 @@ with st.sidebar:
     rule = st.radio(
         "Choose the on-time threshold",
         options=["≤ 0 min (exact on time or early)", "≤ 5 min", "≤ 10 min", "Custom…"],
-        index=1
+        index=1,
+        key="ontime_rule"
     )
     if rule == "≤ 0 min (exact on time or early)":
         threshold = 0
@@ -237,39 +260,104 @@ with st.sidebar:
     elif rule == "≤ 10 min":
         threshold = 10
     else:
-        threshold = st.number_input("Custom threshold (minutes, late allowed):", min_value=0, value=5, step=1)
+        threshold = st.number_input("Custom threshold (minutes, late allowed):", min_value=0, value=5, step=1, key="custom_thresh")
 
     prefer_explicit_delta = st.checkbox(
-        "Prefer 'Stop arrival delta (minutes)' over recomputing from timestamps",
-        value=True
+        "Prefer 'Stop arrival delta (minutes)' over recomputing from timestamps (planned-start based)",
+        value=True,
+        key="prefer_explicit"
     )
 
     avg_mode = st.radio(
         "Average delay mode",
         options=["Raw delay (late only)", "Overage beyond threshold (late only)"],
         index=0,
+        key="avg_mode",
         help="Raw delay averages the minutes late. Overage averages how far past the threshold you were."
     )
     avg_overage = (avg_mode == "Overage beyond threshold (late only)")
 
+    st.header("4) SLA Bands (based on overage beyond threshold)")
+    c_b1, c_b2, c_b3 = st.columns(3)
+    with c_b1: sla_b1 = st.number_input("Band 1 (min)", min_value=1, value=5, step=1, key="sla_b1")
+    with c_b2: sla_b2 = st.number_input("Band 2 (min)", min_value=sla_b1+1, value=15, step=1, key="sla_b2")
+    with c_b3: sla_b3 = st.number_input("Band 3 (min)", min_value=sla_b2+1, value=30, step=1, key="sla_b3")
+
+    # ---------- Presets ----------
+    with st.expander("💾 Presets (save / load)"):
+        # Build current preset payload
+        preset_dict = {
+            "filter_mode": st.session_state.get("filter_mode"),
+            "stops": st.session_state.get("stops_select", []),
+            "carriers": st.session_state.get("carriers_select", []),
+            "created_range": [
+                st.session_state.get("created_range", (min_date, max_date))[0].isoformat() if created_non_null.size else None,
+                st.session_state.get("created_range", (min_date, max_date))[1].isoformat() if created_non_null.size else None,
+            ],
+            "threshold": int(threshold),
+            "prefer_explicit": st.session_state.get("prefer_explicit", True),
+            "avg_mode": st.session_state.get("avg_mode"),
+            "sla_b1": int(sla_b1),
+            "sla_b2": int(sla_b2),
+            "sla_b3": int(sla_b3),
+        }
+        st.download_button(
+            "Download current preset (JSON)",
+            data=json.dumps(preset_dict, indent=2).encode("utf-8"),
+            file_name="ontime_preset.json",
+            mime="application/json",
+        )
+
+        up = st.file_uploader("Load preset (JSON)", type=["json"], key="preset_file")
+        if up is not None and st.button("Apply preset"):
+            try:
+                preset = json.load(up)
+                # Map into session state
+                st.session_state["filter_mode"] = preset.get("filter_mode", "Exclude")
+                st.session_state["stops_select"] = preset.get("stops", [])
+                st.session_state["carriers_select"] = preset.get("carriers", [])
+                cr = preset.get("created_range", [])
+                if cr and len(cr) == 2 and cr[0] and cr[1]:
+                    st.session_state["created_range"] = (date.fromisoformat(cr[0]), date.fromisoformat(cr[1]))
+                st.session_state["ontime_rule"] = "Custom…"
+                st.session_state["custom_thresh"] = int(preset.get("threshold", 5))
+                st.session_state["prefer_explicit"] = bool(preset.get("prefer_explicit", True))
+                st.session_state["avg_mode"] = preset.get("avg_mode", "Raw delay (late only)")
+                st.session_state["sla_b1"] = int(preset.get("sla_b1", 5))
+                st.session_state["sla_b2"] = int(preset.get("sla_b2", 15))
+                st.session_state["sla_b3"] = int(preset.get("sla_b3", 30))
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not apply preset: {e}")
+
 # ---------- Apply filters ----------
 mask = pd.Series(True, index=df.index)
 
-if exclude_stops:
-    mask &= ~df["stop_name"].astype(str).isin(set(exclude_stops))
+# Stop names
+if filter_mode == "Exclude":
+    if stop_selection:
+        mask &= ~df["stop_name"].astype(str).isin(set(stop_selection))
+else:  # Include
+    if stop_selection:
+        mask &= df["stop_name"].astype(str).isin(set(stop_selection))
 
-if exclude_carriers:
-    mask &= ~df["current_carrier"].astype(str).isin(set(exclude_carriers))
+# Carriers
+if filter_mode == "Exclude":
+    if carrier_selection:
+        mask &= ~df["current_carrier"].astype(str).isin(set(carrier_selection))
+else:
+    if carrier_selection:
+        mask &= df["current_carrier"].astype(str).isin(set(carrier_selection))
 
-if start_date and end_date:
-    # Include entire end day
+# Date range
+if isinstance(start_date, date) and isinstance(end_date, date):
     start_dt = pd.to_datetime(datetime.combine(start_date, datetime.min.time()))
     end_dt = pd.to_datetime(datetime.combine(end_date, datetime.max.time()))
     mask &= df["created_time"].between(start_dt, end_dt)
 
 filtered = df[mask].copy()
 
-# ---------- Compute deltas & flags ----------
+# ---------- Compute deltas & flags (planned-start basis for main views) ----------
 # Primary delay series (minutes)
 if prefer_explicit_delta and "arrival_delta_min" in filtered.columns:
     delta_series = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
@@ -285,8 +373,8 @@ if delta_series.notna().sum() == 0:
 
 filtered["delay_minutes"] = delta_series
 filtered["is_on_time"] = filtered["delay_minutes"].apply(lambda x: apply_on_time_rule(x, threshold))
-filtered["arrival_present"] = filtered["actual_arrival"].notna()          # data presence (reported arrival)
-filtered["valid_for_ontime"] = filtered["delay_minutes"].notna()          # can evaluate on-time
+filtered["arrival_present"] = filtered["actual_arrival"].notna()
+filtered["valid_for_ontime"] = filtered["delay_minutes"].notna()
 filtered["is_late"] = filtered["valid_for_ontime"] & (filtered["delay_minutes"] > float(threshold))
 filtered["no_arrival_time"] = ~filtered["arrival_present"]
 
@@ -295,6 +383,26 @@ if avg_overage:
     filtered["late_metric"] = filtered["delay_minutes"].sub(float(threshold)).where(filtered["is_late"])
 else:
     filtered["late_metric"] = filtered["delay_minutes"].where(filtered["is_late"])
+
+# SLA bands (use overage)
+filtered["overage_minutes"] = filtered["delay_minutes"].sub(float(threshold)).clip(lower=0)
+def _sla_band(row):
+    if row["no_arrival_time"]:
+        return "No arrival"
+    v = row["overage_minutes"]
+    if pd.isna(v):
+        return "Not evaluable"
+    if v == 0:
+        return "On-time/early"
+    if v <= sla_b1:
+        return f"≤{sla_b1} min late"
+    if v <= sla_b2:
+        return f"{sla_b1+1}–{sla_b2} min late"
+    if v <= sla_b3:
+        return f"{sla_b2+1}–{sla_b3} min late"
+    return f">{sla_b3} min late"
+
+filtered["sla_band"] = filtered.apply(_sla_band, axis=1)
 
 # ---------- KPIs ----------
 st.subheader("Results")
@@ -318,7 +426,19 @@ with k4: st.metric("Late % (of reported)", f"{late_pct_reported:.1f}%")
 with k5: st.metric(avg_label, f"{avg_late_val:.1f} min")
 
 # ---------- Tabs ----------
-tab_carrier, tab_stop = st.tabs(["📦 Carrier summary", "📍 Stop-level analysis"])
+tab_carrier, tab_stop, tab_trend, tab_ship = st.tabs([
+    "📦 Carrier summary",
+    "📍 Stop-level analysis",
+    "📈 Trends",
+    "🚚 Shipment coverage",
+])
+
+display_grp = pd.DataFrame()
+so_disp = pd.DataFrame()
+sbc_disp = pd.DataFrame()
+trend_disp = pd.DataFrame()
+ship_carrier_disp = pd.DataFrame()
+ship_detail_disp = pd.DataFrame()
 
 # ===== Carrier Summary =====
 with tab_carrier:
@@ -344,6 +464,11 @@ with tab_carrier:
         grp["data_presence_%"] = np.where(grp["total_stops"] > 0, grp["arrival_present"] / grp["total_stops"] * 100, np.nan)
         grp["on_time_%"] = np.where(grp["reportable"] > 0, grp["on_time_stops"] / grp["reportable"] * 100, np.nan)
         grp["late_%"] = np.where(grp["reportable"] > 0, grp["late_stops"] / grp["reportable"] * 100, np.nan)
+
+        # SLA distribution (stacked %)
+        sla_counts = filtered.groupby(["current_carrier", "sla_band"]).size().reset_index(name="count")
+        total_by_carrier = sla_counts.groupby("current_carrier")["count"].transform("sum")
+        sla_counts["percent"] = np.where(total_by_carrier > 0, sla_counts["count"] / total_by_carrier * 100, np.nan)
 
         # Display table
         display_grp = (
@@ -376,32 +501,29 @@ with tab_carrier:
         st.markdown("### On-time / Late by Carrier")
         st.dataframe(display_grp, use_container_width=True)
 
-        # Chart: On-time % by carrier
-        if grp["on_time_%"].notna().any():
-            chart_data = grp.copy()
-            chart_data["On-time %"] = chart_data["on_time_%"].round(2)
+        st.markdown("#### SLA distribution by Carrier")
+        if not sla_counts.empty:
             chart = (
-                alt.Chart(chart_data)
+                alt.Chart(sla_counts)
                 .mark_bar()
                 .encode(
-                    x=alt.X("current_carrier:N", title="Carrier", sort="-y"),
-                    y=alt.Y("On-time %:Q", title="On-time (%)"),
+                    x=alt.X("current_carrier:N", title="Carrier"),
+                    y=alt.Y("percent:Q", stack="normalize", title="Share of stops (%)"),
+                    color=alt.Color("sla_band:N", title="SLA band"),
                     tooltip=[
                         alt.Tooltip("current_carrier:N", title="Carrier"),
-                        alt.Tooltip("total_stops:Q", title="Total stops"),
-                        alt.Tooltip("arrival_present:Q", title="With arrival data"),
-                        alt.Tooltip("reportable:Q", title="Reported (evaluable)"),
-                        alt.Tooltip("on_time_stops:Q", title="On-time stops"),
-                        alt.Tooltip("late_stops:Q", title="Late stops"),
-                        alt.Tooltip("no_arrival_time:Q", title="No arrival time"),
-                        alt.Tooltip("On-time %:Q"),
+                        alt.Tooltip("sla_band:N", title="Band"),
+                        alt.Tooltip("count:Q", title="Stops"),
+                        alt.Tooltip("percent:Q", title="%"),
                     ]
                 )
                 .properties(height=420)
             )
             st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("No SLA distribution to display.")
 
-        # Download
+        # Downloads
         csv = display_grp.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download carrier summary (CSV)",
@@ -459,6 +581,33 @@ with tab_stop:
     stop_by_carrier["late_%"] = np.where(stop_by_carrier["reportable"] > 0,
                                          stop_by_carrier["late_stops"] / stop_by_carrier["reportable"] * 100, np.nan)
 
+    # SLA distribution per stop (optional viz control)
+    st.markdown("##### SLA distribution (select a stop to focus)")
+    chosen_stop = st.selectbox("Pick a stop (optional)", options=["(All)"] + sorted([str(s) for s in filtered["stop_name"].dropna().unique()]))
+    if chosen_stop and chosen_stop != "(All)":
+        sla_by = filtered[filtered["stop_name"].astype(str) == chosen_stop]
+    else:
+        sla_by = filtered
+    sla_counts_stop = sla_by.groupby(["stop_name", "sla_band"]).size().reset_index(name="count")
+    total_by_stop = sla_counts_stop.groupby("stop_name")["count"].transform("sum")
+    sla_counts_stop["percent"] = np.where(total_by_stop > 0, sla_counts_stop["count"] / total_by_stop * 100, np.nan)
+
+    if not sla_counts_stop.empty:
+        chart2 = (
+            alt.Chart(sla_counts_stop)
+            .mark_bar()
+            .encode(
+                x=alt.X("sla_band:N", title="SLA band"),
+                y=alt.Y("percent:Q", title="Share of stops (%)"),
+                column=alt.Column("stop_name:N", title="Stop", header=alt.Header(labelOrient="bottom")),
+                tooltip=[alt.Tooltip("stop_name:N", title="Stop"),
+                         alt.Tooltip("sla_band:N", title="Band"),
+                         alt.Tooltip("count:Q", title="Stops"),
+                         alt.Tooltip("percent:Q", title="%")],
+            )
+        )
+        st.altair_chart(chart2, use_container_width=True)
+
     # Controls
     all_stop_names = sorted([s for s in stop_overall["stop_name"].astype(str).unique()])
     default_top = min(25, len(all_stop_names))
@@ -483,13 +632,13 @@ with tab_stop:
                 "Data presence %": so["data_presence_%"].round(1),
                 "On-time % (reported)": so["on_time_%"].round(1),
                 "Late % (reported)": so["late_%"].round(1),
-                avg_label: so["avg_late_metric"].round(1),
+                "Avg metric (late, min)": so["avg_late_metric"].round(1),
             }
         )[
             [
                 "stop_name", "total_stops", "arrival_present", "reportable",
                 "on_time_stops", "late_stops", "no_arrival_time",
-                "Data presence %", "On-time % (reported)", "Late % (reported)", avg_label
+                "Data presence %", "On-time % (reported)", "Late % (reported)", "Avg metric (late, min)"
             ]
         ]
         .rename(columns={
@@ -505,20 +654,20 @@ with tab_stop:
     st.markdown("#### Overall by Stop")
     st.dataframe(so_disp, use_container_width=True)
 
-    # Display: by stop + carrier (who served on time / late / not reported)
+    # Display: by stop + carrier
     sbc_disp = (
         sbc.assign(
             **{
                 "Data presence %": sbc["data_presence_%"].round(1),
                 "On-time % (reported)": sbc["on_time_%"].round(1),
                 "Late % (reported)": sbc["late_%"].round(1),
-                avg_label: sbc["avg_late_metric"].round(1),
+                "Avg metric (late, min)": sbc["avg_late_metric"].round(1),
             }
         )[
             [
                 "stop_name", "Carrier", "total_stops", "arrival_present", "reportable",
                 "on_time_stops", "late_stops", "no_arrival_time",
-                "Data presence %", "On-time % (reported)", "Late % (reported)", avg_label
+                "Data presence %", "On-time % (reported)", "Late % (reported)", "Avg metric (late, min)"
             ]
         ]
         .rename(columns={
@@ -552,14 +701,353 @@ with tab_stop:
             mime="text/csv",
         )
 
-# ---------- Downloads: filtered rows ----------
-st.subheader("Filtered rows download")
-st.download_button(
-    "Download filtered rows (CSV)",
-    data=filtered.to_csv(index=False).encode("utf-8"),
-    file_name=f"filtered_stops_{date.today().isoformat()}.csv",
-    mime="text/csv"
-)
+# ===== Trends =====
+with tab_trend:
+    st.markdown("### On-time trends")
+    gran = st.radio("Granularity", options=["Daily", "Weekly"], index=0, horizontal=True)
+    if gran == "Daily":
+        grp = (
+            filtered
+            .assign(created_date=filtered["created_time"].dt.date)
+            .groupby("created_date", dropna=False)
+            .agg(
+                total=("stop_name", "size"),
+                reportable=("valid_for_ontime", "sum"),
+                on_time=("is_on_time", lambda s: s.fillna(False).sum()),
+                late=("is_late", lambda s: s.fillna(False).sum()),
+                avg_metric=("late_metric", "mean"),
+            )
+            .reset_index()
+            .rename(columns={"created_date": "date"})
+            .sort_values("date")
+        )
+    else:  # Weekly (Mon-based)
+        grp = (
+            filtered
+            .groupby(pd.Grouper(key="created_time", freq="W-MON"))
+            .agg(
+                total=("stop_name", "size"),
+                reportable=("valid_for_ontime", "sum"),
+                on_time=("is_on_time", lambda s: s.fillna(False).sum()),
+                late=("is_late", lambda s: s.fillna(False).sum()),
+                avg_metric=("late_metric", "mean"),
+            )
+            .reset_index()
+            .rename(columns={"created_time": "date"})
+            .sort_values("date")
+        )
+
+    if grp.empty:
+        st.info("No data for the selected period.")
+    else:
+        grp["on_time_%"] = np.where(grp["reportable"] > 0, grp["on_time"] / grp["reportable"] * 100, np.nan)
+
+        trend_disp = grp.copy()
+        st.dataframe(trend_disp, use_container_width=True)
+
+        line = (
+            alt.Chart(grp)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("on_time_%:Q", title="On-time (%)"),
+                tooltip=[alt.Tooltip("date:T", title="Date"),
+                         alt.Tooltip("on_time_%:Q", title="On-time %"),
+                         alt.Tooltip("total:Q", title="Total"),
+                         alt.Tooltip("reportable:Q", title="Reported"),
+                         alt.Tooltip("avg_metric:Q", title="Avg late metric")]
+            )
+            .properties(height=360)
+        )
+        bars = (
+            alt.Chart(grp)
+            .mark_bar(opacity=0.4)
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("total:Q", title="Stops (total)"),
+                tooltip=[alt.Tooltip("total:Q", title="Total")]
+            )
+            .properties(height=120)
+        )
+        st.altair_chart(bars, use_container_width=True)
+        st.altair_chart(line, use_container_width=True)
+
+        st.download_button(
+            "Download trends (CSV)",
+            data=trend_disp.to_csv(index=False).encode("utf-8"),
+            file_name=f"trends_{gran.lower()}_{date.today().isoformat()}.csv",
+            mime="text/csv",
+        )
+
+# ===== Shipment coverage (planned END basis for on-time) =====
+with tab_ship:
+    st.markdown("### Shipment coverage by Carrier (arrival vs *planned end* & event reporting)")
+
+    # 1) Compute delay vs planned END (minutes) for arrival
+    filtered["delay_end_minutes"] = (
+        (filtered["actual_arrival"] - filtered["planned_arrival_end"])
+        .dt.total_seconds() / 60.0
+    )
+    filtered["on_time_end"] = filtered["delay_end_minutes"].apply(lambda x: apply_on_time_rule(x, threshold))
+
+    # 2) Classify stop role: origin / destination / other
+    filtered["role"] = "other"
+    if "stop_type" in filtered.columns:
+        stype = filtered["stop_type"].astype(str).str.lower()
+        mask_origin = stype.str.contains("origin|pickup|source|load", na=False)
+        mask_dest = stype.str.contains("destination|dest|drop|unload|delivery", na=False)
+        filtered.loc[mask_origin, "role"] = "origin"
+        filtered.loc[mask_dest, "role"] = "destination"
+    # Name match fallback (exact, casefold)
+    if "origin" in filtered.columns:
+        eq_origin = (filtered["stop_name"].astype(str).str.casefold() ==
+                    filtered["origin"].astype(str).str.casefold())
+        filtered.loc[eq_origin, "role"] = "origin"
+    if "destination" in filtered.columns:
+        eq_dest = (filtered["stop_name"].astype(str).str.casefold() ==
+                  filtered["destination"].astype(str).str.casefold())
+        filtered.loc[eq_dest, "role"] = "destination"
+
+    # Per-shipment fallback: if still missing origin/destination, infer by earliest/latest time
+    # Use planned_end, then planned_start, then actual_arrival
+    def _infer_roles(g: pd.DataFrame):
+        roles = g["role"].copy()
+        if (roles == "origin").sum() == 0:
+            t = g["planned_arrival_end"].copy()
+            if t.isna().all():
+                t = g["planned_arrival_start"].copy()
+                if t.isna().all():
+                    t = g["actual_arrival"].copy()
+            if not t.isna().all():
+                idx = t.idxmin()
+                roles.loc[idx] = "origin"
+        if (roles == "destination").sum() == 0:
+            t = g["planned_arrival_end"].copy()
+            if t.isna().all():
+                t = g["planned_arrival_start"].copy()
+                if t.isna().all():
+                    t = g["actual_arrival"].copy()
+            if not t.isna().all():
+                idx = t.idxmax()
+                roles.loc[idx] = "destination"
+        return roles
+
+    filtered["role"] = filtered.groupby("shipment_id", group_keys=False).apply(_infer_roles)
+
+    # 3) Build per-shipment summary
+    ship_rows = []
+    for sid, g in filtered.groupby("shipment_id", dropna=False):
+        g = g.copy()
+        # Shipment-level carrier = mode of carriers across rows (fallback "(Unknown)")
+        ship_carrier = safe_mode(g["current_carrier"], "(Unknown)")
+
+        # Pick a single origin row (earliest planned_end among role == origin)
+        g_origin = g[g["role"] == "origin"]
+        if not g_origin.empty:
+            org_row = g_origin.sort_values("planned_arrival_end", na_position="last").iloc[0]
+            origin_reported = pd.notna(org_row["actual_arrival"])
+            origin_ontime = (org_row["delay_end_minutes"] <= float(threshold)) if origin_reported else np.nan
+        else:
+            origin_reported = False
+            origin_ontime = np.nan
+
+        # Other stops (all rows not origin/destination)
+        g_other = g[g["role"] == "other"]
+        if not g_other.empty:
+            other_total = len(g_other)
+            other_reported_ct = g_other["actual_arrival"].notna().sum()
+            other_reported_pct = other_reported_ct / other_total if other_total > 0 else np.nan
+            g_other_rep = g_other[g_other["actual_arrival"].notna()]
+            other_ontime_pct = (
+                (g_other_rep["delay_end_minutes"] <= float(threshold)).mean() if not g_other_rep.empty else np.nan
+            )
+        else:
+            other_reported_pct = np.nan
+            other_ontime_pct = np.nan
+
+        # Pick a single destination row (latest planned_end among role == destination)
+        g_dest = g[g["role"] == "destination"]
+        if not g_dest.empty:
+            dst_row = g_dest.sort_values("planned_arrival_end", na_position="first").iloc[-1]
+            dest_reported = pd.notna(dst_row["actual_arrival"])
+            dest_ontime = (dst_row["delay_end_minutes"] <= float(threshold)) if dest_reported else np.nan
+        else:
+            dest_reported = False
+            dest_ontime = np.nan
+
+        # All events reported? (both arrival & departure present for every stop row)
+        all_events_reported = bool(g["actual_arrival"].notna().all() and g["actual_departure"].notna().all())
+
+        ship_rows.append({
+            "shipment_id": sid,
+            "carrier": ship_carrier,
+            "origin_arrival_reported": bool(origin_reported),
+            "origin_on_time_end": origin_ontime,  # NaN if not reported
+            "other_arrival_reported_pct": other_reported_pct,  # 0..1 or NaN if no "other" stops
+            "other_on_time_end_pct": other_ontime_pct,        # 0..1 over reported rows
+            "dest_arrival_reported": bool(dest_reported),
+            "dest_on_time_end": dest_ontime,                  # NaN if not reported
+            "all_events_reported": bool(all_events_reported),
+        })
+
+    ship_detail = pd.DataFrame(ship_rows)
+
+    if ship_detail.empty:
+        st.info("No shipment data after filters.")
+    else:
+        # Per-carrier aggregation (percentages)
+        agg = (
+            ship_detail
+            .groupby("carrier", dropna=False)
+            .agg(
+                shipments=("shipment_id", "nunique"),
+                origin_reported_pct=("origin_arrival_reported", lambda s: s.mean()*100),
+                origin_on_time_end_pct=("origin_on_time_end", lambda s: s.dropna().mean()*100 if s.notna().any() else np.nan),
+                other_reported_pct=("other_arrival_reported_pct", lambda s: s.dropna().mean()*100 if s.notna().any() else np.nan),
+                other_on_time_end_pct=("other_on_time_end_pct", lambda s: s.dropna().mean()*100 if s.notna().any() else np.nan),
+                dest_reported_pct=("dest_arrival_reported", lambda s: s.mean()*100),
+                dest_on_time_end_pct=("dest_on_time_end", lambda s: s.dropna().mean()*100 if s.notna().any() else np.nan),
+                all_events_reported_pct=("all_events_reported", lambda s: s.mean()*100),
+            )
+            .reset_index()
+            .rename(columns={"carrier": "Carrier"})
+        )
+
+        # Display table as requested
+        ship_carrier_disp = (
+            agg.assign(
+                **{
+                    "Arrival at origin reported (%)": agg["origin_reported_pct"].round(1),
+                    "Origin arrival on-time (% of reported, planned end)": agg["origin_on_time_end_pct"].round(1),
+                    "% arrival reported at other stop": agg["other_reported_pct"].round(1),
+                    "% arrival at other stop on-time (% of reported, planned end)": agg["other_on_time_end_pct"].round(1),
+                    "% arrival reported at destination stop": agg["dest_reported_pct"].round(1),
+                    "% arrival at destination on-time (% of reported, planned end)": agg["dest_on_time_end_pct"].round(1),
+                    "% shipments with ALL events reported": agg["all_events_reported_pct"].round(1),
+                }
+            )[
+                [
+                    "Carrier", "shipments",
+                    "Arrival at origin reported (%)",
+                    "Origin arrival on-time (% of reported, planned end)",
+                    "% arrival reported at other stop",
+                    "% arrival at other stop on-time (% of reported, planned end)",
+                    "% arrival reported at destination stop",
+                    "% arrival at destination on-time (% of reported, planned end)",
+                    "% shipments with ALL events reported",
+                ]
+            ]
+            .rename(columns={"shipments": "Number of shipments"})
+            .sort_values(["Number of shipments"], ascending=False)
+        )
+
+        st.markdown("#### Coverage by Carrier (planned end basis)")
+        st.dataframe(ship_carrier_disp, use_container_width=True)
+
+        # Also show per-shipment detail if desired
+        with st.expander("Per-shipment detail (planned end basis)"):
+            ship_detail_disp = ship_detail.copy()
+            ship_detail_disp = ship_detail_disp.assign(
+                **{
+                    "Origin arrival reported": ship_detail_disp["origin_arrival_reported"].astype(bool),
+                    "Origin on-time (planned end)": ship_detail_disp["origin_on_time_end"].round(1),
+                    "% other arrivals reported": (ship_detail_disp["other_arrival_reported_pct"] * 100).round(1),
+                    "% other arrivals on-time (planned end)": (ship_detail_disp["other_on_time_end_pct"] * 100).round(1),
+                    "Destination arrival reported": ship_detail_disp["dest_arrival_reported"].astype(bool),
+                    "Destination on-time (planned end)": ship_detail_disp["dest_on_time_end"].round(1),
+                    "ALL events reported": ship_detail_disp["all_events_reported"].astype(bool),
+                }
+            )[
+                [
+                    "shipment_id", "carrier",
+                    "Origin arrival reported", "Origin on-time (planned end)",
+                    "% other arrivals reported", "% other arrivals on-time (planned end)",
+                    "Destination arrival reported", "Destination on-time (planned end)",
+                    "ALL events reported",
+                ]
+            ].rename(columns={"shipment_id": "Shipment ID", "carrier": "Carrier"})
+            st.dataframe(ship_detail_disp, use_container_width=True)
+
+        # Downloads
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "Download shipment coverage by carrier (CSV)",
+                data=ship_carrier_disp.to_csv(index=False).encode("utf-8"),
+                file_name=f"shipment_coverage_carrier_{date.today().isoformat()}.csv",
+                mime="text/csv",
+            )
+        with c2:
+            st.download_button(
+                "Download per-shipment detail (CSV)",
+                data=ship_detail_disp.to_csv(index=False).encode("utf-8"),
+                file_name=f"shipment_coverage_detail_{date.today().isoformat()}.csv",
+                mime="text/csv",
+            )
+
+# ---------- Downloads: filtered rows & Excel workbook ----------
+st.subheader("Downloads")
+cA, cB, cC = st.columns(3)
+with cA:
+    st.download_button(
+        "Download filtered rows (CSV)",
+        data=filtered.to_csv(index=False).encode("utf-8"),
+        file_name=f"filtered_stops_{date.today().isoformat()}.csv",
+        mime="text/csv"
+    )
+
+with cB:
+    # Build multi-sheet Excel (filtered, carrier, stop overall, stop×carrier, trends, shipment coverage)
+    xls_buf = io.BytesIO()
+    with pd.ExcelWriter(xls_buf, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm", date_format="yyyy-mm-dd") as writer:
+        filtered.to_excel(writer, index=False, sheet_name="Filtered rows")
+        if not display_grp.empty:
+            display_grp.to_excel(writer, index=False, sheet_name="Carrier summary")
+        if not so_disp.empty:
+            so_disp.to_excel(writer, index=False, sheet_name="Stop overall")
+        if not sbc_disp.empty:
+            sbc_disp.to_excel(writer, index=False, sheet_name="Stop x Carrier")
+        if not trend_disp.empty:
+            trend_disp.to_excel(writer, index=False, sheet_name="Trends")
+        if not ship_carrier_disp.empty:
+            ship_carrier_disp.to_excel(writer, index=False, sheet_name="Shipment covg (carrier)")
+        if not ship_detail_disp.empty:
+            ship_detail_disp.to_excel(writer, index=False, sheet_name="Shipment covg (detail)")
+        # Auto width
+        for ws in writer.sheets.values():
+            try:
+                if ws.name == "Filtered rows":
+                    df_for_ws = filtered
+                elif ws.name == "Carrier summary":
+                    df_for_ws = display_grp
+                elif ws.name == "Stop overall":
+                    df_for_ws = so_disp
+                elif ws.name == "Stop x Carrier":
+                    df_for_ws = sbc_disp
+                elif ws.name == "Trends":
+                    df_for_ws = trend_disp
+                elif ws.name == "Shipment covg (carrier)":
+                    df_for_ws = ship_carrier_disp
+                elif ws.name == "Shipment covg (detail)":
+                    df_for_ws = ship_detail_disp
+                else:
+                    df_for_ws = None
+                if df_for_ws is not None and not df_for_ws.empty:
+                    for i, col in enumerate(df_for_ws.columns):
+                        width = min(max(10, int(df_for_ws[col].astype(str).str.len().quantile(0.9)) + 2), 60)
+                        ws.set_column(i, i, width)
+            except Exception:
+                pass
+
+    st.download_button(
+        "Download Excel report (multi-sheet)",
+        data=xls_buf.getvalue(),
+        file_name=f"on_time_report_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+with cC:
+    st.info("Tip: Use Presets in the sidebar to save your filter setup for later.")
 
 # ---------- Details / Diagnostics ----------
 with st.expander("Column Mapping & Data Health"):
@@ -567,7 +1055,8 @@ with st.expander("Column Mapping & Data Health"):
     mapped = {EXPECTED_COLUMNS[k]: col_map[k] for k in col_map}
     st.json(mapped)
 
-    key_cols = ["stop_name", "current_carrier", "planned_arrival_start", "actual_arrival", "arrival_delta_min", "created_time"]
+    key_cols = ["stop_name", "current_carrier", "planned_arrival_start", "planned_arrival_end",
+                "actual_arrival", "arrival_delta_min", "created_time", "shipment_id"]
     present_keys = [c for c in key_cols if c in filtered.columns]
     if present_keys:
         st.write("**Nulls in key columns (after filters):**")
