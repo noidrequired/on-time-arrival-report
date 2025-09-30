@@ -234,6 +234,7 @@ with st.sidebar:
     if created_non_null.empty:
         st.warning("No valid 'Created time' values found. Date filter disabled.")
         start_date, end_date = None, None
+        default_range = None
     else:
         min_date = created_non_null.min().date()
         max_date = created_non_null.max().date()
@@ -244,6 +245,7 @@ with st.sidebar:
             max_value=max_date,
             key="created_range"
         )
+        default_range = (min_date, max_date)
 
     st.header("3) On-time Rule")
 
@@ -286,14 +288,17 @@ with st.sidebar:
     # ---------- Presets ----------
     with st.expander("💾 Presets (save / load)"):
         # Build current preset payload
+        cr_state = st.session_state.get("created_range", default_range)
+        if cr_state:
+            cr_serialized = [cr_state[0].isoformat(), cr_state[1].isoformat()]
+        else:
+            cr_serialized = [None, None]
+
         preset_dict = {
             "filter_mode": st.session_state.get("filter_mode"),
             "stops": st.session_state.get("stops_select", []),
             "carriers": st.session_state.get("carriers_select", []),
-            "created_range": [
-                st.session_state.get("created_range", (min_date, max_date))[0].isoformat() if created_non_null.size else None,
-                st.session_state.get("created_range", (min_date, max_date))[1].isoformat() if created_non_null.size else None,
-            ],
+            "created_range": cr_serialized,
             "threshold": int(threshold),
             "prefer_explicit": st.session_state.get("prefer_explicit", True),
             "avg_mode": st.session_state.get("avg_mode"),
@@ -654,7 +659,7 @@ with tab_stop:
     st.markdown("#### Overall by Stop")
     st.dataframe(so_disp, use_container_width=True)
 
-    # Display: by stop + carrier
+    # Display: by stop + carrier (who served on time / late / not reported)
     sbc_disp = (
         sbc.assign(
             **{
@@ -809,7 +814,6 @@ with tab_ship:
         filtered.loc[eq_dest, "role"] = "destination"
 
     # Per-shipment fallback: if still missing origin/destination, infer by earliest/latest time
-    # Use planned_end, then planned_start, then actual_arrival
     def _infer_roles(g: pd.DataFrame):
         roles = g["role"].copy()
         if (roles == "origin").sum() == 0:
@@ -838,10 +842,9 @@ with tab_ship:
     ship_rows = []
     for sid, g in filtered.groupby("shipment_id", dropna=False):
         g = g.copy()
-        # Shipment-level carrier = mode of carriers across rows (fallback "(Unknown)")
         ship_carrier = safe_mode(g["current_carrier"], "(Unknown)")
 
-        # Pick a single origin row (earliest planned_end among role == origin)
+        # Origin row
         g_origin = g[g["role"] == "origin"]
         if not g_origin.empty:
             org_row = g_origin.sort_values("planned_arrival_end", na_position="last").iloc[0]
@@ -851,7 +854,7 @@ with tab_ship:
             origin_reported = False
             origin_ontime = np.nan
 
-        # Other stops (all rows not origin/destination)
+        # Other stops
         g_other = g[g["role"] == "other"]
         if not g_other.empty:
             other_total = len(g_other)
@@ -865,7 +868,7 @@ with tab_ship:
             other_reported_pct = np.nan
             other_ontime_pct = np.nan
 
-        # Pick a single destination row (latest planned_end among role == destination)
+        # Destination row
         g_dest = g[g["role"] == "destination"]
         if not g_dest.empty:
             dst_row = g_dest.sort_values("planned_arrival_end", na_position="first").iloc[-1]
@@ -875,7 +878,7 @@ with tab_ship:
             dest_reported = False
             dest_ontime = np.nan
 
-        # All events reported? (both arrival & departure present for every stop row)
+        # All events reported? (arrival & departure for every stop)
         all_events_reported = bool(g["actual_arrival"].notna().all() and g["actual_departure"].notna().all())
 
         ship_rows.append({
@@ -944,18 +947,24 @@ with tab_ship:
         st.markdown("#### Coverage by Carrier (planned end basis)")
         st.dataframe(ship_carrier_disp, use_container_width=True)
 
-        # Also show per-shipment detail if desired
+        # Per-shipment detail with Yes/No/N/A mapping
         with st.expander("Per-shipment detail (planned end basis)"):
             ship_detail_disp = ship_detail.copy()
+
+            def yes_no_na(x):
+                if pd.isna(x):
+                    return "N/A"
+                return "Yes" if bool(x) else "No"
+
             ship_detail_disp = ship_detail_disp.assign(
                 **{
-                    "Origin arrival reported": ship_detail_disp["origin_arrival_reported"].astype(bool),
-                    "Origin on-time (planned end)": ship_detail_disp["origin_on_time_end"].round(1),
+                    "Origin arrival reported": ship_detail_disp["origin_arrival_reported"].map(yes_no_na),
+                    "Origin on-time (planned end)": ship_detail_disp["origin_on_time_end"].map(yes_no_na),
                     "% other arrivals reported": (ship_detail_disp["other_arrival_reported_pct"] * 100).round(1),
                     "% other arrivals on-time (planned end)": (ship_detail_disp["other_on_time_end_pct"] * 100).round(1),
-                    "Destination arrival reported": ship_detail_disp["dest_arrival_reported"].astype(bool),
-                    "Destination on-time (planned end)": ship_detail_disp["dest_on_time_end"].round(1),
-                    "ALL events reported": ship_detail_disp["all_events_reported"].astype(bool),
+                    "Destination arrival reported": ship_detail_disp["dest_arrival_reported"].map(yes_no_na),
+                    "Destination on-time (planned end)": ship_detail_disp["dest_on_time_end"].map(yes_no_na),
+                    "ALL events reported": ship_detail_disp["all_events_reported"].map(yes_no_na),
                 }
             )[
                 [
@@ -1013,25 +1022,27 @@ with cB:
             ship_carrier_disp.to_excel(writer, index=False, sheet_name="Shipment covg (carrier)")
         if not ship_detail_disp.empty:
             ship_detail_disp.to_excel(writer, index=False, sheet_name="Shipment covg (detail)")
-        # Auto width
-        for ws in writer.sheets.values():
+
+        # Auto-fit column widths using sheet names to pick dataframes
+        for sheet_name, ws in writer.sheets.items():
             try:
-                if ws.name == "Filtered rows":
+                if sheet_name == "Filtered rows":
                     df_for_ws = filtered
-                elif ws.name == "Carrier summary":
+                elif sheet_name == "Carrier summary":
                     df_for_ws = display_grp
-                elif ws.name == "Stop overall":
+                elif sheet_name == "Stop overall":
                     df_for_ws = so_disp
-                elif ws.name == "Stop x Carrier":
+                elif sheet_name == "Stop x Carrier":
                     df_for_ws = sbc_disp
-                elif ws.name == "Trends":
+                elif sheet_name == "Trends":
                     df_for_ws = trend_disp
-                elif ws.name == "Shipment covg (carrier)":
+                elif sheet_name == "Shipment covg (carrier)":
                     df_for_ws = ship_carrier_disp
-                elif ws.name == "Shipment covg (detail)":
+                elif sheet_name == "Shipment covg (detail)":
                     df_for_ws = ship_detail_disp
                 else:
                     df_for_ws = None
+
                 if df_for_ws is not None and not df_for_ws.empty:
                     for i, col in enumerate(df_for_ws.columns):
                         width = min(max(10, int(df_for_ws[col].astype(str).str.len().quantile(0.9)) + 2), 60)
