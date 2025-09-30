@@ -132,12 +132,33 @@ def _mk_column_config(df: pd.DataFrame) -> dict:
     return cfg
 
 def pretty_df(df: pd.DataFrame, *, use_container_width=True, height=None, hide_index=True):
-    """Drop-in replacement for st.dataframe with better formatting."""
+    """
+    Drop-in replacement for st.dataframe with better formatting.
+    Auto-detects percent/minute/datetime columns and applies formatting.
+
+    Streamlit 1.36+: avoid passing height=None; only pass height if it's a positive int or "auto".
+    """
     if df is None or df.empty:
         st.info("No data to display.")
         return
+
     cfg = _mk_column_config(df)
-    st.dataframe(df, use_container_width=use_container_width, height=height, hide_index=hide_index, column_config=cfg)
+
+    kwargs = dict(
+        use_container_width=use_container_width,
+        hide_index=hide_index,
+        column_config=cfg,
+    )
+
+    # Pass height only if valid
+    if isinstance(height, (int, np.integer)) and int(height) > 0:
+        kwargs["height"] = int(height)
+    elif height == "auto":
+        kwargs["height"] = "auto"
+    # else: omit height entirely
+
+    st.dataframe(df, **kwargs)
+
 
 # Enable theme + CSS
 _register_altair_theme()
