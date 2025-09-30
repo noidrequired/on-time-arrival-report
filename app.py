@@ -14,11 +14,11 @@ st.set_page_config(
 )
 
 st.title("On-Time Arrival Report")
-st.caption("Upload your Excel → choose filters → see on-time performance by carrier")
+st.caption("Upload your Excel → choose filters → see on-time performance by carrier and stop")
 
 # ---------- Helpers ----------
 EXPECTED_COLUMNS = {
-    # left side = our internal key ; right side = expected user column name (case/space tolerant)
+    # left side = internal key ; right side = expected label (case/space tolerant)
     "stop_type": "Stop type",
     "stop_name": "Stop name",
     "stop_city": "Stop city",
@@ -84,9 +84,7 @@ REQUIRED_FOR_REPORT = {
 }
 
 def normalize_columns(cols):
-    # Lowercase + strip spaces for matching; keep original to map back
-    norm = {c: " ".join(str(c).strip().split()).lower() for c in cols}
-    return norm
+    return {c: " ".join(str(c).strip().split()).lower() for c in cols}
 
 def build_column_map(df_columns):
     norm = normalize_columns(df_columns)
@@ -156,14 +154,12 @@ if df_raw.empty:
 
 col_map = build_column_map(df_raw.columns)
 
-# Build missing list using keys first, then convert to labels
+# Missing required cols (keys → labels)
 missing_keys = [k for k in REQUIRED_FOR_REPORT if k not in col_map]
-# 'arrival_delta_min' is preferred but we can compute if the timestamps are present
 if "arrival_delta_min" in missing_keys and all(
     k in col_map for k in ["planned_arrival_start", "actual_arrival"]
 ):
     missing_keys.remove("arrival_delta_min")
-
 missing_for_report = [EXPECTED_COLUMNS[k] for k in missing_keys]
 if missing_for_report:
     st.error(
@@ -172,7 +168,7 @@ if missing_for_report:
     )
     st.stop()
 
-# Keep only columns we recognized, then rename to internal keys
+# Keep only recognized columns; rename to internal keys
 df = df_raw[list(col_map.values())].copy()
 df.columns = [k for k in col_map.keys()]
 
@@ -248,6 +244,14 @@ with st.sidebar:
         value=True
     )
 
+    avg_mode = st.radio(
+        "Average delay mode",
+        options=["Raw delay (late only)", "Overage beyond threshold (late only)"],
+        index=0,
+        help="Raw delay averages the minutes late. Overage averages how far past the threshold you were."
+    )
+    avg_overage = (avg_mode == "Overage beyond threshold (late only)")
+
 # ---------- Apply filters ----------
 mask = pd.Series(True, index=df.index)
 
@@ -265,144 +269,297 @@ if start_date and end_date:
 
 filtered = df[mask].copy()
 
-# ---------- Compute on-time ----------
-# Build a numeric delta series (coerce strings like ' ' → NaN).
+# ---------- Compute deltas & flags ----------
+# Primary delay series (minutes)
 if prefer_explicit_delta and "arrival_delta_min" in filtered.columns:
     delta_series = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
 else:
     delta_series = filtered.apply(compute_arrival_delta_minutes, axis=1)
 
-# If recomputed/all-NaN, try the other source as a fallback
+# Fallback if unusable
 if delta_series.notna().sum() == 0:
     if prefer_explicit_delta:
-        # fallback to recompute
         delta_series = filtered.apply(compute_arrival_delta_minutes, axis=1)
     elif "arrival_delta_min" in filtered.columns:
-        # fallback to explicit numeric
         delta_series = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
 
-filtered["is_on_time"] = delta_series.apply(lambda x: apply_on_time_rule(x, threshold))
+filtered["delay_minutes"] = delta_series
+filtered["is_on_time"] = filtered["delay_minutes"].apply(lambda x: apply_on_time_rule(x, threshold))
+filtered["arrival_present"] = filtered["actual_arrival"].notna()          # data presence (reported arrival)
+filtered["valid_for_ontime"] = filtered["delay_minutes"].notna()          # can evaluate on-time
+filtered["is_late"] = filtered["valid_for_ontime"] & (filtered["delay_minutes"] > float(threshold))
+filtered["no_arrival_time"] = ~filtered["arrival_present"]
 
-# Flags for visibility and aggregation
-filtered["valid_for_ontime"] = delta_series.notna()
-filtered["no_arrival_time"] = filtered["actual_arrival"].isna()
+# Late metric for averaging (dynamic: raw vs overage)
+if avg_overage:
+    filtered["late_metric"] = filtered["delay_minutes"].sub(float(threshold)).where(filtered["is_late"])
+else:
+    filtered["late_metric"] = filtered["delay_minutes"].where(filtered["is_late"])
 
-# ---------- Report ----------
+# ---------- KPIs ----------
 st.subheader("Results")
 
-left, mid, right = st.columns(3)
-with left:
-    st.metric("Stops (after filters)", f"{len(filtered):,}")
+k1, k2, k3, k4, k5 = st.columns(5)
+total_rows = len(filtered)
+with_arrival = int(filtered["arrival_present"].sum())
+reportable = int(filtered["valid_for_ontime"].sum())
+no_arrival_ct = int(filtered["no_arrival_time"].sum())
+late_ct = int(filtered["is_late"].fillna(False).sum())
 
-with mid:
-    valid = int(filtered["valid_for_ontime"].sum())
-    st.metric("Stops with arrival data", f"{valid:,}")
+data_presence_pct = (with_arrival / total_rows * 100) if total_rows else 0.0
+late_pct_reported = (late_ct / reportable * 100) if reportable else 0.0
+avg_late_val = float(filtered["late_metric"].mean()) if late_ct else 0.0
+avg_label = "Avg overage (late, min)" if avg_overage else "Avg delay (late, min)"
 
-with right:
-    no_arrival_ct = int(filtered["no_arrival_time"].sum())
-    st.metric("Stops with no arrival time", f"{no_arrival_ct:,}")
+with k1: st.metric("Stops (after filters)", f"{total_rows:,}")
+with k2: st.metric("With arrival data", f"{with_arrival:,}", f"{data_presence_pct:.1f}% data presence")
+with k3: st.metric("No arrival time", f"{no_arrival_ct:,}")
+with k4: st.metric("Late % (of reported)", f"{late_pct_reported:.1f}%")
+with k5: st.metric(avg_label, f"{avg_late_val:.1f} min")
 
-# On-time rate among stops with arrival data
-ontime = int(filtered["is_on_time"].fillna(False).sum())
-rate = (ontime / valid * 100) if valid else 0.0
-st.metric("On-time rate (of those with arrival data)", f"{rate:.1f}%")
+# ---------- Tabs ----------
+tab_carrier, tab_stop = st.tabs(["📦 Carrier summary", "📍 Stop-level analysis"])
 
-# Group by carrier
-if "current_carrier" not in filtered.columns or filtered.empty:
-    st.warning("No data available to aggregate by carrier with the current filters.")
-else:
-    grp = (
+# ===== Carrier Summary =====
+with tab_carrier:
+    if "current_carrier" not in filtered.columns or filtered.empty:
+        st.warning("No data available to aggregate by carrier with the current filters.")
+    else:
+        grp = (
+            filtered
+            .groupby("current_carrier", dropna=False)
+            .agg(
+                total_stops=("stop_name", "size"),
+                arrival_present=("arrival_present", "sum"),
+                reportable=("valid_for_ontime", "sum"),
+                on_time_stops=("is_on_time", lambda s: s.fillna(False).sum()),
+                late_stops=("is_late", lambda s: s.fillna(False).sum()),
+                no_arrival_time=("no_arrival_time", "sum"),
+                avg_late_metric=("late_metric", "mean"),
+            )
+            .reset_index()
+        )
+
+        # Rates
+        grp["data_presence_%"] = np.where(grp["total_stops"] > 0, grp["arrival_present"] / grp["total_stops"] * 100, np.nan)
+        grp["on_time_%"] = np.where(grp["reportable"] > 0, grp["on_time_stops"] / grp["reportable"] * 100, np.nan)
+        grp["late_%"] = np.where(grp["reportable"] > 0, grp["late_stops"] / grp["reportable"] * 100, np.nan)
+
+        # Display table
+        display_grp = (
+            grp.rename(columns={"current_carrier": "Carrier"})
+               .assign(
+                    **{
+                        "Data presence %": grp["data_presence_%"].round(1),
+                        "On-time % (reported)": grp["on_time_%"].round(1),
+                        "Late % (reported)": grp["late_%"].round(1),
+                        avg_label: grp["avg_late_metric"].round(1),
+                    }
+                )[
+                    [
+                        "Carrier", "total_stops", "arrival_present", "reportable",
+                        "on_time_stops", "late_stops", "no_arrival_time",
+                        "Data presence %", "On-time % (reported)", "Late % (reported)", avg_label
+                    ]
+                ]
+                .rename(columns={
+                    "total_stops": "Total stops",
+                    "arrival_present": "With arrival data",
+                    "reportable": "Reported (evaluable)",
+                    "on_time_stops": "On-time stops",
+                    "late_stops": "Late stops",
+                    "no_arrival_time": "No arrival time",
+                })
+                .sort_values(["Late % (reported)", "Total stops"], ascending=[False, False])
+        )
+
+        st.markdown("### On-time / Late by Carrier")
+        st.dataframe(display_grp, use_container_width=True)
+
+        # Chart: On-time % by carrier
+        if grp["on_time_%"].notna().any():
+            chart_data = grp.copy()
+            chart_data["On-time %"] = chart_data["on_time_%"].round(2)
+            chart = (
+                alt.Chart(chart_data)
+                .mark_bar()
+                .encode(
+                    x=alt.X("current_carrier:N", title="Carrier", sort="-y"),
+                    y=alt.Y("On-time %:Q", title="On-time (%)"),
+                    tooltip=[
+                        alt.Tooltip("current_carrier:N", title="Carrier"),
+                        alt.Tooltip("total_stops:Q", title="Total stops"),
+                        alt.Tooltip("arrival_present:Q", title="With arrival data"),
+                        alt.Tooltip("reportable:Q", title="Reported (evaluable)"),
+                        alt.Tooltip("on_time_stops:Q", title="On-time stops"),
+                        alt.Tooltip("late_stops:Q", title="Late stops"),
+                        alt.Tooltip("no_arrival_time:Q", title="No arrival time"),
+                        alt.Tooltip("On-time %:Q"),
+                    ]
+                )
+                .properties(height=420)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+        # Download
+        csv = display_grp.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download carrier summary (CSV)",
+            data=csv,
+            file_name=f"carrier_summary_{date.today().isoformat()}.csv",
+            mime="text/csv",
+        )
+
+# ===== Stop-level Analysis =====
+with tab_stop:
+    st.markdown("### Stop-level performance (overall and by carrier)")
+
+    # Overall by stop (all carriers combined)
+    stop_overall = (
         filtered
-        .groupby("current_carrier", dropna=False)
+        .groupby("stop_name", dropna=False)
         .agg(
-            total_stops=("stop_name", "size"),                 # includes rows with NA
-            with_arrival_data=("valid_for_ontime", "sum"),     # rows where delta is evaluable
+            total_stops=("stop_name", "size"),
+            arrival_present=("arrival_present", "sum"),
+            reportable=("valid_for_ontime", "sum"),
             on_time_stops=("is_on_time", lambda s: s.fillna(False).sum()),
-            no_arrival_time=("no_arrival_time", "sum"),        # rows missing actual_arrival
+            late_stops=("is_late", lambda s: s.fillna(False).sum()),
+            no_arrival_time=("no_arrival_time", "sum"),
+            avg_late_metric=("late_metric", "mean"),
         )
         .reset_index()
     )
-    # On-time % computed only over those with arrival data
-    grp["on_time_rate"] = np.where(grp["with_arrival_data"] > 0,
-                                   grp["on_time_stops"] / grp["with_arrival_data"],
-                                   np.nan)
+    stop_overall["data_presence_%"] = np.where(stop_overall["total_stops"] > 0,
+                                               stop_overall["arrival_present"] / stop_overall["total_stops"] * 100, np.nan)
+    stop_overall["on_time_%"] = np.where(stop_overall["reportable"] > 0,
+                                         stop_overall["on_time_stops"] / stop_overall["reportable"] * 100, np.nan)
+    stop_overall["late_%"] = np.where(stop_overall["reportable"] > 0,
+                                      stop_overall["late_stops"] / stop_overall["reportable"] * 100, np.nan)
 
-    st.markdown("### On-time by Carrier")
-    display_grp = (
-        grp
-        .assign(**{"On-time %": (grp["on_time_rate"] * 100).round(1)})
-        .rename(columns={
-            "current_carrier": "Carrier",
-            "total_stops": "Total stops",
-            "with_arrival_data": "With arrival data",
-            "no_arrival_time": "No arrival time",
-            "on_time_stops": "On-time stops",
-        })[
-            ["Carrier", "Total stops", "With arrival data", "No arrival time", "On-time stops", "On-time %"]
+    # By stop + carrier
+    stop_by_carrier = (
+        filtered
+        .groupby(["stop_name", "current_carrier"], dropna=False)
+        .agg(
+            total_stops=("stop_name", "size"),
+            arrival_present=("arrival_present", "sum"),
+            reportable=("valid_for_ontime", "sum"),
+            on_time_stops=("is_on_time", lambda s: s.fillna(False).sum()),
+            late_stops=("is_late", lambda s: s.fillna(False).sum()),
+            no_arrival_time=("no_arrival_time", "sum"),
+            avg_late_metric=("late_metric", "mean"),
+        )
+        .reset_index()
+        .rename(columns={"current_carrier": "Carrier"})
+    )
+    stop_by_carrier["data_presence_%"] = np.where(stop_by_carrier["total_stops"] > 0,
+                                                  stop_by_carrier["arrival_present"] / stop_by_carrier["total_stops"] * 100, np.nan)
+    stop_by_carrier["on_time_%"] = np.where(stop_by_carrier["reportable"] > 0,
+                                            stop_by_carrier["on_time_stops"] / stop_by_carrier["reportable"] * 100, np.nan)
+    stop_by_carrier["late_%"] = np.where(stop_by_carrier["reportable"] > 0,
+                                         stop_by_carrier["late_stops"] / stop_by_carrier["reportable"] * 100, np.nan)
+
+    # Controls
+    all_stop_names = sorted([s for s in stop_overall["stop_name"].astype(str).unique()])
+    default_top = min(25, len(all_stop_names))
+    col_sel1, col_sel2 = st.columns([2,1])
+    with col_sel1:
+        focus_stops = st.multiselect("Focus on specific Stop names (optional)", options=all_stop_names, default=[])
+    with col_sel2:
+        top_n = st.number_input("Show top N by total stops (if no selection)", min_value=1, max_value=max(1, len(all_stop_names)), value=default_top, step=1)
+
+    # Filter tables based on selection
+    if focus_stops:
+        so = stop_overall[stop_overall["stop_name"].astype(str).isin(set(focus_stops))].copy()
+        sbc = stop_by_carrier[stop_by_carrier["stop_name"].astype(str).isin(set(focus_stops))].copy()
+    else:
+        so = stop_overall.sort_values("total_stops", ascending=False).head(top_n).copy()
+        sbc = stop_by_carrier[stop_by_carrier["stop_name"].isin(so["stop_name"])].copy()
+
+    # Display: overall by stop
+    so_disp = (
+        so.assign(
+            **{
+                "Data presence %": so["data_presence_%"].round(1),
+                "On-time % (reported)": so["on_time_%"].round(1),
+                "Late % (reported)": so["late_%"].round(1),
+                avg_label: so["avg_late_metric"].round(1),
+            }
+        )[
+            [
+                "stop_name", "total_stops", "arrival_present", "reportable",
+                "on_time_stops", "late_stops", "no_arrival_time",
+                "Data presence %", "On-time % (reported)", "Late % (reported)", avg_label
+            ]
         ]
-        .sort_values(["On-time %", "Total stops"], ascending=[False, False])
+        .rename(columns={
+            "stop_name": "Stop",
+            "total_stops": "Total stops",
+            "arrival_present": "With arrival data",
+            "reportable": "Reported (evaluable)",
+            "on_time_stops": "On-time stops",
+            "late_stops": "Late stops",
+            "no_arrival_time": "No arrival time",
+        })
     )
-    st.dataframe(display_grp, use_container_width=True)
+    st.markdown("#### Overall by Stop")
+    st.dataframe(so_disp, use_container_width=True)
 
-    # Chart (On-time % by carrier)
-    if grp["on_time_rate"].notna().any():
-        chart_data = grp.copy()
-        chart_data["On-time %"] = (chart_data["on_time_rate"] * 100).round(2)
-        chart = (
-            alt.Chart(chart_data)
-            .mark_bar()
-            .encode(
-                x=alt.X("current_carrier:N", title="Carrier", sort="-y"),
-                y=alt.Y("On-time %:Q", title="On-time (%)"),
-                tooltip=[
-                    alt.Tooltip("current_carrier:N", title="Carrier"),
-                    alt.Tooltip("total_stops:Q", title="Total stops"),
-                    alt.Tooltip("with_arrival_data:Q", title="With arrival data"),
-                    alt.Tooltip("no_arrival_time:Q", title="No arrival time"),
-                    alt.Tooltip("on_time_stops:Q", title="On-time stops"),
-                    alt.Tooltip("On-time %:Q"),
-                ]
-            )
-            .properties(height=420)
+    # Display: by stop + carrier (who served on time / late / not reported)
+    sbc_disp = (
+        sbc.assign(
+            **{
+                "Data presence %": sbc["data_presence_%"].round(1),
+                "On-time % (reported)": sbc["on_time_%"].round(1),
+                "Late % (reported)": sbc["late_%"].round(1),
+                avg_label: sbc["avg_late_metric"].round(1),
+            }
+        )[
+            [
+                "stop_name", "Carrier", "total_stops", "arrival_present", "reportable",
+                "on_time_stops", "late_stops", "no_arrival_time",
+                "Data presence %", "On-time % (reported)", "Late % (reported)", avg_label
+            ]
+        ]
+        .rename(columns={
+            "stop_name": "Stop",
+            "total_stops": "Total stops",
+            "arrival_present": "With arrival data",
+            "reportable": "Reported (evaluable)",
+            "on_time_stops": "On-time stops",
+            "late_stops": "Late stops",
+            "no_arrival_time": "No arrival time",
+        })
+        .sort_values(["Stop", "Late % (reported)", "Total stops"], ascending=[True, False, False])
+    )
+    st.markdown("#### By Stop × Carrier (who served on time / late / not reported)")
+    st.dataframe(sbc_disp, use_container_width=True)
+
+    # Downloads
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Download stop overall (CSV)",
+            data=so_disp.to_csv(index=False).encode("utf-8"),
+            file_name=f"stop_overall_{date.today().isoformat()}.csv",
+            mime="text/csv",
         )
-        st.altair_chart(chart, use_container_width=True)
-
-# ---------- Downloads ----------
-st.subheader("Downloads")
-col1, col2 = st.columns(2)
-
-with col1:
-    st.download_button(
-        "Download filtered rows (CSV)",
-        data=filtered.to_csv(index=False).encode("utf-8"),
-        file_name=f"filtered_stops_{date.today().isoformat()}.csv",
-        mime="text/csv"
-    )
-
-with col2:
-    out = grp.copy() if 'grp' in locals() else pd.DataFrame()
-    if not out.empty:
-        out = (
-            out.assign(on_time_percent=(out["on_time_rate"] * 100).round(1))
-               .rename(columns={
-                    "current_carrier": "Carrier",
-                    "total_stops": "Total stops",
-                    "with_arrival_data": "With arrival data",
-                    "no_arrival_time": "No arrival time",
-                    "on_time_stops": "On-time stops",
-                    "on_time_percent": "On-time %"
-               })[
-                    ["Carrier", "Total stops", "With arrival data", "No arrival time", "On-time stops", "On-time %"]
-               ]
+    with c2:
+        st.download_button(
+            "Download stop × carrier (CSV)",
+            data=sbc_disp.to_csv(index=False).encode("utf-8"),
+            file_name=f"stop_by_carrier_{date.today().isoformat()}.csv",
+            mime="text/csv",
         )
-    csv = out.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download on-time by carrier (CSV)",
-        data=csv,
-        file_name=f"on_time_by_carrier_{date.today().isoformat()}.csv",
-        mime="text/csv",
-        disabled=out.empty
-    )
+
+# ---------- Downloads: filtered rows ----------
+st.subheader("Filtered rows download")
+st.download_button(
+    "Download filtered rows (CSV)",
+    data=filtered.to_csv(index=False).encode("utf-8"),
+    file_name=f"filtered_stops_{date.today().isoformat()}.csv",
+    mime="text/csv"
+)
 
 # ---------- Details / Diagnostics ----------
 with st.expander("Column Mapping & Data Health"):
@@ -410,14 +567,12 @@ with st.expander("Column Mapping & Data Health"):
     mapped = {EXPECTED_COLUMNS[k]: col_map[k] for k in col_map}
     st.json(mapped)
 
-    # Quick NA summary for key fields
     key_cols = ["stop_name", "current_carrier", "planned_arrival_start", "actual_arrival", "arrival_delta_min", "created_time"]
     present_keys = [c for c in key_cols if c in filtered.columns]
     if present_keys:
         st.write("**Nulls in key columns (after filters):**")
         st.write(filtered[present_keys].isna().sum())
 
-    # Visibility on non-numeric deltas
     if "arrival_delta_min" in filtered.columns:
         tmp = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
         st.write("Non-numeric 'Stop arrival delta (minutes)' after coercion:", int(tmp.isna().sum()))
