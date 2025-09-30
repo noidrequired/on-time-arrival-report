@@ -7,9 +7,7 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-# =====================================================================
-#                           Page Setup
-# =====================================================================
+# ---------- Page Setup ----------
 st.set_page_config(
     page_title="On-Time Arrival Report",
     page_icon="✅",
@@ -19,149 +17,9 @@ st.set_page_config(
 st.title("On-Time Arrival Report")
 st.caption("Upload your Excel → choose filters → see on-time performance by carrier, stop, and shipment coverage")
 
-# =====================================================================
-#                        UI Beauty Pack ✨
-# =====================================================================
-def _register_altair_theme():
-    def streamlit_nice():
-        return {
-            "config": {
-                "view": {"strokeWidth": 0},
-                "axis": {
-                    "grid": True,
-                    "gridColor": "#eceff4",
-                    "domainColor": "#d8dee9",
-                    "labelColor": "#2e3440",
-                    "titleColor": "#2e3440",
-                    "labelFontSize": 12,
-                    "titleFontSize": 13,
-                },
-                "legend": {"labelColor": "#2e3440", "titleColor": "#2e3440"},
-                "range": {
-                    "category": [
-                        "#4e79a7","#f28e2b","#e15759","#76b7b2",
-                        "#59a14f","#edc949","#af7aa1","#ff9da7",
-                        "#9c755f","#bab0ab"
-                    ]
-                },
-                "line": {"strokeWidth": 3},
-                "bar": {"cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4},
-                "area": {"opacity": 0.85}
-            }
-        }
-    alt.themes.register("streamlit_nice", streamlit_nice)
-    alt.themes.enable("streamlit_nice")
-
-def polish_chart(c: alt.Chart, height=360):
-    return (
-        c.properties(height=height)
-         .interactive()
-         .configure_point(size=60)
-         .configure_mark(tooltip=True)
-    )
-
-def inject_css():
-    st.markdown(
-        """
-        <style>
-        .block-container { padding-top: 1.2rem; padding-bottom: 3rem; }
-        h1, h2, h3 { letter-spacing: .2px; }
-        button[role="tab"] { padding: .6rem 1rem !important; border-radius: 10px !important; }
-        div[data-testid="stMetric"] {
-            background: #f7f9fc; border: 1px solid #eef2f7;
-            border-radius: 14px; padding: 12px 10px; box-shadow: 0 1px 2px rgba(0,0,0,.04);
-        }
-        div[data-testid="stDataFrame"] table { font-size: 0.92rem; }
-        summary { font-weight: 600; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-from pandas.api.types import (
-    is_datetime64_any_dtype as is_dt,
-    is_integer_dtype,
-    is_float_dtype,
-)
-
-def _guess_progress(col_name: str) -> bool:
-    n = str(col_name).lower()
-    return (
-        "%" in n or "percent" in n or n.endswith(" pct") or n.endswith(" %")
-        or "on-time" in n or "late %"
-    )
-
-def _guess_minutes(col_name: str) -> bool:
-    n = str(col_name).lower()
-    return "min" in n or "minute" in n or "(min" in n or n.endswith(" min")
-
-def _mk_column_config(df: pd.DataFrame) -> dict:
-    cfg = {}
-    for c in df.columns:
-        # datetime columns
-        try:
-            if is_dt(df[c]):
-                cfg[c] = st.column_config.DatetimeColumn(c, format="YYYY-MM-DD HH:mm")
-                continue
-        except Exception:
-            pass
-        # percentages -> progress bars (0-100)
-        if _guess_progress(c):
-            cfg[c] = st.column_config.ProgressColumn(
-                str(c), help="Percentage", format="%.1f%%", min_value=0, max_value=100
-            )
-            continue
-        # minutes -> number with unit
-        if _guess_minutes(c):
-            cfg[c] = st.column_config.NumberColumn(str(c), format="%.1f min")
-            continue
-        # counts / integers
-        try:
-            if is_integer_dtype(df[c]):
-                cfg[c] = st.column_config.NumberColumn(str(c), format="%d")
-                continue
-        except Exception:
-            pass
-        # floats (one decimal)
-        try:
-            if is_float_dtype(df[c]):
-                cfg[c] = st.column_config.NumberColumn(str(c), format="%.1f")
-                continue
-        except Exception:
-            pass
-    return cfg
-
-def pretty_df(df: pd.DataFrame, *, use_container_width=True, height=None, hide_index=True):
-    """
-    Drop-in replacement for st.dataframe with better formatting.
-    Streamlit 1.36+: avoid passing height=None; only pass height if it's a positive int or "auto".
-    """
-    if df is None or df.empty:
-        st.info("No data to display.")
-        return
-
-    cfg = _mk_column_config(df)
-
-    kwargs = dict(
-        use_container_width=use_container_width,
-        hide_index=hide_index,
-        column_config=cfg,
-    )
-    if isinstance(height, (int, np.integer)) and int(height) > 0:
-        kwargs["height"] = int(height)
-    elif height == "auto":
-        kwargs["height"] = "auto"
-
-    st.dataframe(df, **kwargs)
-
-# Enable theme + CSS
-_register_altair_theme()
-inject_css()
-
-# =====================================================================
-#                              Helpers
-# =====================================================================
+# ---------- Helpers ----------
 EXPECTED_COLUMNS = {
+    # left side = internal key ; right side = expected label (case/space tolerant)
     "stop_type": "Stop type",
     "stop_name": "Stop name",
     "stop_city": "Stop city",
@@ -249,6 +107,7 @@ def read_excel(file_bytes) -> pd.DataFrame:
     return pd.read_excel(file_bytes, engine="openpyxl")
 
 def compute_arrival_delta_minutes(row):
+    # Fallback when explicit 'Stop arrival delta (minutes)' is missing
     try:
         a = row.get("actual_arrival")
         p = row.get("planned_arrival_start")
@@ -259,6 +118,7 @@ def compute_arrival_delta_minutes(row):
     return np.nan
 
 def apply_on_time_rule(delta_minutes, threshold_minutes):
+    # Robust: return NaN when the delta can't be parsed
     if pd.isna(delta_minutes):
         return np.nan
     try:
@@ -273,9 +133,7 @@ def safe_mode(series: pd.Series, fallback="(Unknown)"):
     vc = ser.value_counts()
     return vc.index[0] if not vc.empty else fallback
 
-# =====================================================================
-#                           Sidebar: File upload
-# =====================================================================
+# ---------- Sidebar: File upload ----------
 with st.sidebar:
     st.header("1) Upload Excel")
     uploaded = st.file_uploader("Choose an .xlsx file", type=["xlsx"])
@@ -293,9 +151,7 @@ if uploaded is None:
     st.info("⬅️ Upload your Excel file in the sidebar to begin.")
     st.stop()
 
-# =====================================================================
-#                         Load & validate
-# =====================================================================
+# ---------- Load & validate ----------
 try:
     df_raw = read_excel(uploaded)
 except Exception as e:
@@ -308,6 +164,7 @@ if df_raw.empty:
 
 col_map = build_column_map(df_raw.columns)
 
+# Missing required cols (keys → labels)
 missing_keys = [k for k in REQUIRED_FOR_REPORT if k not in col_map]
 if "arrival_delta_min" in missing_keys and all(
     k in col_map for k in ["planned_arrival_start", "actual_arrival"]
@@ -339,12 +196,11 @@ for c in df.columns:
 if "arrival_delta_min" not in df.columns:
     df["arrival_delta_min"] = df.apply(compute_arrival_delta_minutes, axis=1)
 
-# =====================================================================
-#                            Sidebar: Filters
-# =====================================================================
+# ---------- Sidebar: Filters ----------
 with st.sidebar:
     st.header("2) Filters")
 
+    # Include / Exclude switch (applies to both Stop and Carrier)
     filter_mode = st.radio(
         "Filter mode",
         options=["Exclude", "Include"],
@@ -353,6 +209,7 @@ with st.sidebar:
         help="Exclude: remove selected. Include: keep only selected (if none selected, keep all)."
     )
 
+    # Stop names
     all_stops = sorted([s for s in df["stop_name"].dropna().astype(str).unique()])
     stop_selection = st.multiselect(
         "Stop names",
@@ -362,6 +219,7 @@ with st.sidebar:
         help="Select stops to Exclude/Include per the filter mode above."
     )
 
+    # Carriers
     all_carriers = sorted([c for c in df["current_carrier"].dropna().astype(str).unique()])
     carrier_selection = st.multiselect(
         "Carriers",
@@ -371,6 +229,7 @@ with st.sidebar:
         help="Select carriers to Exclude/Include per the filter mode above."
     )
 
+    # Date range on Created time
     created_non_null = df["created_time"].dropna()
     if created_non_null.empty:
         st.warning("No valid 'Created time' values found. Date filter disabled.")
@@ -418,7 +277,7 @@ with st.sidebar:
         key="avg_mode",
         help="Raw delay averages the minutes late. Overage averages how far past the threshold you were."
     )
-    avg_overage_sidebar = (avg_mode == "Overage beyond threshold (late only)")
+    avg_overage = (avg_mode == "Overage beyond threshold (late only)")
 
     st.header("4) SLA Bands (based on overage beyond threshold)")
     c_b1, c_b2, c_b3 = st.columns(3)
@@ -426,7 +285,9 @@ with st.sidebar:
     with c_b2: sla_b2 = st.number_input("Band 2 (min)", min_value=sla_b1+1, value=15, step=1, key="sla_b2")
     with c_b3: sla_b3 = st.number_input("Band 3 (min)", min_value=sla_b2+1, value=30, step=1, key="sla_b3")
 
+    # ---------- Presets ----------
     with st.expander("💾 Presets (save / load)"):
+        # Build current preset payload
         cr_state = st.session_state.get("created_range", default_range)
         if cr_state:
             cr_serialized = [cr_state[0].isoformat(), cr_state[1].isoformat()]
@@ -456,6 +317,7 @@ with st.sidebar:
         if up is not None and st.button("Apply preset"):
             try:
                 preset = json.load(up)
+                # Map into session state
                 st.session_state["filter_mode"] = preset.get("filter_mode", "Exclude")
                 st.session_state["stops_select"] = preset.get("stops", [])
                 st.session_state["carriers_select"] = preset.get("carriers", [])
@@ -473,9 +335,7 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Could not apply preset: {e}")
 
-# =====================================================================
-#                           Apply filters
-# =====================================================================
+# ---------- Apply filters ----------
 mask = pd.Series(True, index=df.index)
 
 # Stop names
@@ -502,16 +362,16 @@ if isinstance(start_date, date) and isinstance(end_date, date):
 
 filtered = df[mask].copy()
 
-# =====================================================================
-#             Compute deltas & flags (planned-start basis)
-# =====================================================================
-if "arrival_delta_min" in filtered.columns and st.session_state.get("prefer_explicit", True):
+# ---------- Compute deltas & flags (planned-start basis for main views) ----------
+# Primary delay series (minutes)
+if prefer_explicit_delta and "arrival_delta_min" in filtered.columns:
     delta_series = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
 else:
     delta_series = filtered.apply(compute_arrival_delta_minutes, axis=1)
 
+# Fallback if unusable
 if delta_series.notna().sum() == 0:
-    if st.session_state.get("prefer_explicit", True):
+    if prefer_explicit_delta:
         delta_series = filtered.apply(compute_arrival_delta_minutes, axis=1)
     elif "arrival_delta_min" in filtered.columns:
         delta_series = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
@@ -524,17 +384,12 @@ filtered["is_late"] = filtered["valid_for_ontime"] & (filtered["delay_minutes"] 
 filtered["no_arrival_time"] = ~filtered["arrival_present"]
 
 # Late metric for averaging (dynamic: raw vs overage)
-avg_overage = (st.session_state.get("avg_mode") == "Overage beyond threshold (late only)")
 if avg_overage:
     filtered["late_metric"] = filtered["delay_minutes"].sub(float(threshold)).where(filtered["is_late"])
 else:
     filtered["late_metric"] = filtered["delay_minutes"].where(filtered["is_late"])
 
 # SLA bands (use overage)
-sla_b1 = st.session_state.get("sla_b1", 5)
-sla_b2 = st.session_state.get("sla_b2", 15)
-sla_b3 = st.session_state.get("sla_b3", 30)
-
 filtered["overage_minutes"] = filtered["delay_minutes"].sub(float(threshold)).clip(lower=0)
 def _sla_band(row):
     if row["no_arrival_time"]:
@@ -554,10 +409,8 @@ def _sla_band(row):
 
 filtered["sla_band"] = filtered.apply(_sla_band, axis=1)
 
-# =====================================================================
-#                               KPIs
-# =====================================================================
-st.subheader("Results ✨")
+# ---------- KPIs ----------
+st.subheader("Results")
 
 k1, k2, k3, k4, k5 = st.columns(5)
 total_rows = len(filtered)
@@ -577,9 +430,7 @@ with k3: st.metric("No arrival time", f"{no_arrival_ct:,}")
 with k4: st.metric("Late % (of reported)", f"{late_pct_reported:.1f}%")
 with k5: st.metric(avg_label, f"{avg_late_val:.1f} min")
 
-# =====================================================================
-#                                 Tabs
-# =====================================================================
+# ---------- Tabs ----------
 tab_carrier, tab_stop, tab_trend, tab_ship = st.tabs([
     "📦 Carrier summary",
     "📍 Stop-level analysis",
@@ -594,9 +445,8 @@ trend_disp = pd.DataFrame()
 ship_carrier_disp = pd.DataFrame()
 ship_detail_disp = pd.DataFrame()
 
-# =========================== Carrier Summary ==========================
+# ===== Carrier Summary =====
 with tab_carrier:
-    st.markdown("### On-time / Late by Carrier 🚚")
     if "current_carrier" not in filtered.columns or filtered.empty:
         st.warning("No data available to aggregate by carrier with the current filters.")
     else:
@@ -615,14 +465,17 @@ with tab_carrier:
             .reset_index()
         )
 
+        # Rates
         grp["data_presence_%"] = np.where(grp["total_stops"] > 0, grp["arrival_present"] / grp["total_stops"] * 100, np.nan)
         grp["on_time_%"] = np.where(grp["reportable"] > 0, grp["on_time_stops"] / grp["reportable"] * 100, np.nan)
         grp["late_%"] = np.where(grp["reportable"] > 0, grp["late_stops"] / grp["reportable"] * 100, np.nan)
 
+        # SLA distribution (stacked %)
         sla_counts = filtered.groupby(["current_carrier", "sla_band"]).size().reset_index(name="count")
         total_by_carrier = sla_counts.groupby("current_carrier")["count"].transform("sum")
         sla_counts["percent"] = np.where(total_by_carrier > 0, sla_counts["count"] / total_by_carrier * 100, np.nan)
 
+        # Display table
         display_grp = (
             grp.rename(columns={"current_carrier": "Carrier"})
                .assign(
@@ -650,9 +503,10 @@ with tab_carrier:
                 .sort_values(["Late % (reported)", "Total stops"], ascending=[False, False])
         )
 
-        pretty_df(display_grp, use_container_width=True)
+        st.markdown("### On-time / Late by Carrier")
+        st.dataframe(display_grp, use_container_width=True)
 
-        st.markdown("#### SLA distribution by Carrier 📊")
+        st.markdown("#### SLA distribution by Carrier")
         if not sla_counts.empty:
             chart = (
                 alt.Chart(sla_counts)
@@ -668,11 +522,13 @@ with tab_carrier:
                         alt.Tooltip("percent:Q", title="%"),
                     ]
                 )
+                .properties(height=420)
             )
-            st.altair_chart(polish_chart(chart, height=420), use_container_width=True)
+            st.altair_chart(chart, use_container_width=True)
         else:
             st.info("No SLA distribution to display.")
 
+        # Downloads
         csv = display_grp.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download carrier summary (CSV)",
@@ -681,10 +537,11 @@ with tab_carrier:
             mime="text/csv",
         )
 
-# ========================= Stop-level Analysis ========================
+# ===== Stop-level Analysis =====
 with tab_stop:
-    st.markdown("### Stop-level performance (overall and by carrier) 🧭")
+    st.markdown("### Stop-level performance (overall and by carrier)")
 
+    # Overall by stop (all carriers combined)
     stop_overall = (
         filtered
         .groupby("stop_name", dropna=False)
@@ -706,6 +563,7 @@ with tab_stop:
     stop_overall["late_%"] = np.where(stop_overall["reportable"] > 0,
                                       stop_overall["late_stops"] / stop_overall["reportable"] * 100, np.nan)
 
+    # By stop + carrier
     stop_by_carrier = (
         filtered
         .groupby(["stop_name", "current_carrier"], dropna=False)
@@ -728,6 +586,7 @@ with tab_stop:
     stop_by_carrier["late_%"] = np.where(stop_by_carrier["reportable"] > 0,
                                          stop_by_carrier["late_stops"] / stop_by_carrier["reportable"] * 100, np.nan)
 
+    # SLA distribution per stop (optional viz control)
     st.markdown("##### SLA distribution (select a stop to focus)")
     chosen_stop = st.selectbox("Pick a stop (optional)", options=["(All)"] + sorted([str(s) for s in filtered["stop_name"].dropna().unique()]))
     if chosen_stop and chosen_stop != "(All)":
@@ -752,8 +611,9 @@ with tab_stop:
                          alt.Tooltip("percent:Q", title="%")],
             )
         )
-        st.altair_chart(polish_chart(chart2, height=360), use_container_width=True)
+        st.altair_chart(chart2, use_container_width=True)
 
+    # Controls
     all_stop_names = sorted([s for s in stop_overall["stop_name"].astype(str).unique()])
     default_top = min(25, len(all_stop_names))
     col_sel1, col_sel2 = st.columns([2,1])
@@ -762,6 +622,7 @@ with tab_stop:
     with col_sel2:
         top_n = st.number_input("Show top N by total stops (if no selection)", min_value=1, max_value=max(1, len(all_stop_names)), value=default_top, step=1)
 
+    # Filter tables based on selection
     if focus_stops:
         so = stop_overall[stop_overall["stop_name"].astype(str).isin(set(focus_stops))].copy()
         sbc = stop_by_carrier[stop_by_carrier["stop_name"].astype(str).isin(set(focus_stops))].copy()
@@ -769,7 +630,7 @@ with tab_stop:
         so = stop_overall.sort_values("total_stops", ascending=False).head(top_n).copy()
         sbc = stop_by_carrier[stop_by_carrier["stop_name"].isin(so["stop_name"])].copy()
 
-    st.markdown("#### Overall by Stop")
+    # Display: overall by stop
     so_disp = (
         so.assign(
             **{
@@ -795,9 +656,10 @@ with tab_stop:
             "no_arrival_time": "No arrival time",
         })
     )
-    pretty_df(so_disp, use_container_width=True)
+    st.markdown("#### Overall by Stop")
+    st.dataframe(so_disp, use_container_width=True)
 
-    st.markdown("#### By Stop × Carrier (who served on time / late / not reported)")
+    # Display: by stop + carrier (who served on time / late / not reported)
     sbc_disp = (
         sbc.assign(
             **{
@@ -824,8 +686,10 @@ with tab_stop:
         })
         .sort_values(["Stop", "Late % (reported)", "Total stops"], ascending=[True, False, False])
     )
-    pretty_df(sbc_disp, use_container_width=True)
+    st.markdown("#### By Stop × Carrier (who served on time / late / not reported)")
+    st.dataframe(sbc_disp, use_container_width=True)
 
+    # Downloads
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
@@ -842,9 +706,9 @@ with tab_stop:
             mime="text/csv",
         )
 
-# =============================== Trends ===============================
+# ===== Trends =====
 with tab_trend:
-    st.markdown("### On-time trends 📈")
+    st.markdown("### On-time trends")
     gran = st.radio("Granularity", options=["Daily", "Weekly"], index=0, horizontal=True)
     if gran == "Daily":
         grp = (
@@ -862,7 +726,7 @@ with tab_trend:
             .rename(columns={"created_date": "date"})
             .sort_values("date")
         )
-    else:
+    else:  # Weekly (Mon-based)
         grp = (
             filtered
             .groupby(pd.Grouper(key="created_time", freq="W-MON"))
@@ -884,7 +748,7 @@ with tab_trend:
         grp["on_time_%"] = np.where(grp["reportable"] > 0, grp["on_time"] / grp["reportable"] * 100, np.nan)
 
         trend_disp = grp.copy()
-        pretty_df(trend_disp, use_container_width=True)
+        st.dataframe(trend_disp, use_container_width=True)
 
         line = (
             alt.Chart(grp)
@@ -898,6 +762,7 @@ with tab_trend:
                          alt.Tooltip("reportable:Q", title="Reported"),
                          alt.Tooltip("avg_metric:Q", title="Avg late metric")]
             )
+            .properties(height=360)
         )
         bars = (
             alt.Chart(grp)
@@ -907,9 +772,10 @@ with tab_trend:
                 y=alt.Y("total:Q", title="Stops (total)"),
                 tooltip=[alt.Tooltip("total:Q", title="Total")]
             )
+            .properties(height=120)
         )
-        st.altair_chart(polish_chart(bars, height=120), use_container_width=True)
-        st.altair_chart(polish_chart(line, height=360), use_container_width=True)
+        st.altair_chart(bars, use_container_width=True)
+        st.altair_chart(line, use_container_width=True)
 
         st.download_button(
             "Download trends (CSV)",
@@ -918,17 +784,18 @@ with tab_trend:
             mime="text/csv",
         )
 
-# =========================== Shipment coverage ========================
+# ===== Shipment coverage (planned END basis for on-time) =====
 with tab_ship:
-    st.markdown("### Shipment coverage by Carrier (arrival vs *planned end* & event reporting) 🚚")
-    # Arrival vs planned END
+    st.markdown("### Shipment coverage by Carrier (arrival vs *planned end* & event reporting)")
+
+    # 1) Compute delay vs planned END (minutes) for arrival
     filtered["delay_end_minutes"] = (
         (filtered["actual_arrival"] - filtered["planned_arrival_end"])
         .dt.total_seconds() / 60.0
     )
     filtered["on_time_end"] = filtered["delay_end_minutes"].apply(lambda x: apply_on_time_rule(x, threshold))
 
-    # Role classification (origin/destination/other)
+    # 2) Classify stop role: origin / destination / other
     filtered["role"] = "other"
     if "stop_type" in filtered.columns:
         stype = filtered["stop_type"].astype(str).str.lower()
@@ -936,6 +803,7 @@ with tab_ship:
         mask_dest = stype.str.contains("destination|dest|drop|unload|delivery", na=False)
         filtered.loc[mask_origin, "role"] = "origin"
         filtered.loc[mask_dest, "role"] = "destination"
+    # Name match fallback (exact, casefold)
     if "origin" in filtered.columns:
         eq_origin = (filtered["stop_name"].astype(str).str.casefold() ==
                     filtered["origin"].astype(str).str.casefold())
@@ -945,6 +813,7 @@ with tab_ship:
                   filtered["destination"].astype(str).str.casefold())
         filtered.loc[eq_dest, "role"] = "destination"
 
+    # Per-shipment fallback: if still missing origin/destination, infer by earliest/latest time
     def _infer_roles(g: pd.DataFrame):
         roles = g["role"].copy()
         if (roles == "origin").sum() == 0:
@@ -969,12 +838,13 @@ with tab_ship:
 
     filtered["role"] = filtered.groupby("shipment_id", group_keys=False).apply(_infer_roles)
 
-    # Per-shipment summary
+    # 3) Build per-shipment summary
     ship_rows = []
     for sid, g in filtered.groupby("shipment_id", dropna=False):
         g = g.copy()
         ship_carrier = safe_mode(g["current_carrier"], "(Unknown)")
 
+        # Origin row
         g_origin = g[g["role"] == "origin"]
         if not g_origin.empty:
             org_row = g_origin.sort_values("planned_arrival_end", na_position="last").iloc[0]
@@ -984,6 +854,7 @@ with tab_ship:
             origin_reported = False
             origin_ontime = np.nan
 
+        # Other stops
         g_other = g[g["role"] == "other"]
         if not g_other.empty:
             other_total = len(g_other)
@@ -997,6 +868,7 @@ with tab_ship:
             other_reported_pct = np.nan
             other_ontime_pct = np.nan
 
+        # Destination row
         g_dest = g[g["role"] == "destination"]
         if not g_dest.empty:
             dst_row = g_dest.sort_values("planned_arrival_end", na_position="first").iloc[-1]
@@ -1006,17 +878,18 @@ with tab_ship:
             dest_reported = False
             dest_ontime = np.nan
 
+        # All events reported? (arrival & departure for every stop)
         all_events_reported = bool(g["actual_arrival"].notna().all() and g["actual_departure"].notna().all())
 
         ship_rows.append({
             "shipment_id": sid,
             "carrier": ship_carrier,
             "origin_arrival_reported": bool(origin_reported),
-            "origin_on_time_end": origin_ontime,
-            "other_arrival_reported_pct": other_reported_pct,
-            "other_on_time_end_pct": other_ontime_pct,
+            "origin_on_time_end": origin_ontime,  # NaN if not reported
+            "other_arrival_reported_pct": other_reported_pct,  # 0..1 or NaN if no "other" stops
+            "other_on_time_end_pct": other_ontime_pct,        # 0..1 over reported rows
             "dest_arrival_reported": bool(dest_reported),
-            "dest_on_time_end": dest_ontime,
+            "dest_on_time_end": dest_ontime,                  # NaN if not reported
             "all_events_reported": bool(all_events_reported),
         })
 
@@ -1025,6 +898,7 @@ with tab_ship:
     if ship_detail.empty:
         st.info("No shipment data after filters.")
     else:
+        # Per-carrier aggregation (percentages)
         agg = (
             ship_detail
             .groupby("carrier", dropna=False)
@@ -1042,6 +916,7 @@ with tab_ship:
             .rename(columns={"carrier": "Carrier"})
         )
 
+        # Display table as requested
         ship_carrier_disp = (
             agg.assign(
                 **{
@@ -1069,9 +944,10 @@ with tab_ship:
             .sort_values(["Number of shipments"], ascending=False)
         )
 
-        st.markdown("#### Coverage by Carrier")
-        pretty_df(ship_carrier_disp, use_container_width=True)
+        st.markdown("#### Coverage by Carrier (planned end basis)")
+        st.dataframe(ship_carrier_disp, use_container_width=True)
 
+        # Per-shipment detail with Yes/No/N/A mapping
         with st.expander("Per-shipment detail (planned end basis)"):
             ship_detail_disp = ship_detail.copy()
 
@@ -1099,8 +975,9 @@ with tab_ship:
                     "ALL events reported",
                 ]
             ].rename(columns={"shipment_id": "Shipment ID", "carrier": "Carrier"})
-            pretty_df(ship_detail_disp, use_container_width=True)
+            st.dataframe(ship_detail_disp, use_container_width=True)
 
+        # Downloads
         c1, c2 = st.columns(2)
         with c1:
             st.download_button(
@@ -1117,10 +994,8 @@ with tab_ship:
                 mime="text/csv",
             )
 
-# =====================================================================
-#                Downloads: filtered rows & Excel workbook
-# =====================================================================
-st.subheader("Downloads ⬇️")
+# ---------- Downloads: filtered rows & Excel workbook ----------
+st.subheader("Downloads")
 cA, cB, cC = st.columns(3)
 with cA:
     st.download_button(
@@ -1130,21 +1005,10 @@ with cA:
         mime="text/csv"
     )
 
-# Pick Excel engine dynamically (robust), but prefer xlsxwriter for autosizing
-try:
-    import xlsxwriter  # noqa: F401
-    EXCEL_ENGINE = "xlsxwriter"
-    EXCEL_SUPPORTS_SET_COLUMN = True
-except Exception:
-    EXCEL_ENGINE = "openpyxl"
-    EXCEL_SUPPORTS_SET_COLUMN = False
-
 with cB:
+    # Build multi-sheet Excel (filtered, carrier, stop overall, stop×carrier, trends, shipment coverage)
     xls_buf = io.BytesIO()
-    with pd.ExcelWriter(
-        xls_buf, engine=EXCEL_ENGINE,
-        datetime_format="yyyy-mm-dd hh:mm", date_format="yyyy-mm-dd"
-    ) as writer:
+    with pd.ExcelWriter(xls_buf, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm", date_format="yyyy-mm-dd") as writer:
         filtered.to_excel(writer, index=False, sheet_name="Filtered rows")
         if not display_grp.empty:
             display_grp.to_excel(writer, index=False, sheet_name="Carrier summary")
@@ -1159,60 +1023,32 @@ with cB:
         if not ship_detail_disp.empty:
             ship_detail_disp.to_excel(writer, index=False, sheet_name="Shipment covg (detail)")
 
-        # Auto-fit column widths
-        if EXCEL_SUPPORTS_SET_COLUMN:
-            # XlsxWriter path
-            for sheet_name, ws in writer.sheets.items():
-                try:
-                    if sheet_name == "Filtered rows":
-                        df_for_ws = filtered
-                    elif sheet_name == "Carrier summary":
-                        df_for_ws = display_grp
-                    elif sheet_name == "Stop overall":
-                        df_for_ws = so_disp
-                    elif sheet_name == "Stop x Carrier":
-                        df_for_ws = sbc_disp
-                    elif sheet_name == "Trends":
-                        df_for_ws = trend_disp
-                    elif sheet_name == "Shipment covg (carrier)":
-                        df_for_ws = ship_carrier_disp
-                    elif sheet_name == "Shipment covg (detail)":
-                        df_for_ws = ship_detail_disp
-                    else:
-                        df_for_ws = None
-                    if df_for_ws is not None and not df_for_ws.empty:
-                        for i, col in enumerate(df_for_ws.columns):
-                            width = min(max(10, int(df_for_ws[col].astype(str).str.len().quantile(0.9)) + 2), 60)
-                            ws.set_column(i, i, width)
-                except Exception:
-                    pass
-        else:
-            # OpenPyXL fallback
-            from openpyxl.utils import get_column_letter
-            for sheet_name, ws in writer.sheets.items():
-                try:
-                    if sheet_name == "Filtered rows":
-                        df_for_ws = filtered
-                    elif sheet_name == "Carrier summary":
-                        df_for_ws = display_grp
-                    elif sheet_name == "Stop overall":
-                        df_for_ws = so_disp
-                    elif sheet_name == "Stop x Carrier":
-                        df_for_ws = sbc_disp
-                    elif sheet_name == "Trends":
-                        df_for_ws = trend_disp
-                    elif sheet_name == "Shipment covg (carrier)":
-                        df_for_ws = ship_carrier_disp
-                    elif sheet_name == "Shipment covg (detail)":
-                        df_for_ws = ship_detail_disp
-                    else:
-                        df_for_ws = None
-                    if df_for_ws is not None and not df_for_ws.empty:
-                        for i, col in enumerate(df_for_ws.columns, start=1):
-                            width = min(max(10, int(df_for_ws[col].astype(str).str.len().quantile(0.9)) + 2), 60)
-                            ws.column_dimensions[get_column_letter(i)].width = width
-                except Exception:
-                    pass
+        # Auto-fit column widths using sheet names to pick dataframes
+        for sheet_name, ws in writer.sheets.items():
+            try:
+                if sheet_name == "Filtered rows":
+                    df_for_ws = filtered
+                elif sheet_name == "Carrier summary":
+                    df_for_ws = display_grp
+                elif sheet_name == "Stop overall":
+                    df_for_ws = so_disp
+                elif sheet_name == "Stop x Carrier":
+                    df_for_ws = sbc_disp
+                elif sheet_name == "Trends":
+                    df_for_ws = trend_disp
+                elif sheet_name == "Shipment covg (carrier)":
+                    df_for_ws = ship_carrier_disp
+                elif sheet_name == "Shipment covg (detail)":
+                    df_for_ws = ship_detail_disp
+                else:
+                    df_for_ws = None
+
+                if df_for_ws is not None and not df_for_ws.empty:
+                    for i, col in enumerate(df_for_ws.columns):
+                        width = min(max(10, int(df_for_ws[col].astype(str).str.len().quantile(0.9)) + 2), 60)
+                        ws.set_column(i, i, width)
+            except Exception:
+                pass
 
     st.download_button(
         "Download Excel report (multi-sheet)",
@@ -1224,10 +1060,8 @@ with cB:
 with cC:
     st.info("Tip: Use Presets in the sidebar to save your filter setup for later.")
 
-# =====================================================================
-#                       Details / Diagnostics
-# =====================================================================
-with st.expander("Column Mapping & Data Health 🩺"):
+# ---------- Details / Diagnostics ----------
+with st.expander("Column Mapping & Data Health"):
     st.write("**Recognized columns** (Excel → internal):")
     mapped = {EXPECTED_COLUMNS[k]: col_map[k] for k in col_map}
     st.json(mapped)
@@ -1237,7 +1071,8 @@ with st.expander("Column Mapping & Data Health 🩺"):
     present_keys = [c for c in key_cols if c in filtered.columns]
     if present_keys:
         st.write("**Nulls in key columns (after filters):**")
-        pretty_df(filtered[present_keys].isna().sum().to_frame("Nulls").T)
+        st.write(filtered[present_keys].isna().sum())
+
     if "arrival_delta_min" in filtered.columns:
         tmp = pd.to_numeric(filtered["arrival_delta_min"], errors="coerce")
         st.write("Non-numeric 'Stop arrival delta (minutes)' after coercion:", int(tmp.isna().sum()))
